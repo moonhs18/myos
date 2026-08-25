@@ -15,6 +15,26 @@ void uart_init(void){
 }
 
 void uart_putc(char c){
-    while ()
-    
+    while (*UARTFR & FR_TXFF);
+
+    if(c=='\n'){
+        *UARTDR = '\r';
+        while (*UARTFR & FR_TXFF);
+    }
+    *UARTDR = (uint32_t)c;
 }
+
+void uart_puts(const char *s){
+    while(*s){
+        uart_putc(*s++);
+    }
+}
+
+void uart_put_hex(uint64_t val){
+    const char hex_chars[] = "0123456789ABCDEF";
+    uart_puts("0x");
+    for(int i = 60; i >= 0; i -= 4){
+        uart_putc(hex_chars[(val >> i) & 0xF]);
+    }
+}
+

@@ -1,27 +1,27 @@
-typedef unsigned char  uint8_t;
-typedef unsigned short uint16_t;
-typedef unsigned int   uint32_t;
+#include "uart.h"
 
-#define VGA_MEMORY ((uint16_t*)0xB8000)
+// linker.ld에 정의된 심볼 참조
+extern char __stack_top[];
+extern char __kernel_end[];
 
-void kernel_main(uint32_t magic, uint32_t multiboot_info)
-{
-    (void)magic;
-    (void)multiboot_info;
+void kernel_main(void) {
+    uart_init();
 
-    const char *message = "Hello from MyOS!";
+    uart_puts("\n==============================\n");
+    uart_puts("[MiniOS] Booting AArch64 Kernel...\n");
+    uart_puts("==============================\n");
 
-    uint8_t color = 0x0F;
+    uart_puts("Kernel End Address : ");
+    uart_put_hex((uint64_t)__kernel_end);
+    uart_puts("\n");
 
-    for (int i = 0; message[i] != '\0'; i++)
-    {
-        VGA_MEMORY[i] =
-            (uint16_t)message[i] |
-            ((uint16_t)color << 8);
-    }
+    uart_puts("Kernel Stack Top   : ");
+    uart_put_hex((uint64_t)__stack_top);
+    uart_puts("\n");
 
-    while (1)
-    {
-        __asm__ volatile ("hlt");
+    uart_puts("[MiniOS] Ready for Exception Vector setup.\n");
+
+    while (1) {
+        // Halt state
     }
 }

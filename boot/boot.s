@@ -4,7 +4,7 @@
 _start:
 	mrs x0, mpidr_el1
 	and x0, x0, #0xFF
-	cbz x0, master_core
+	cbz x0, el_setup
 
 hang:
 	wfe
@@ -18,11 +18,10 @@ el_setup:
 	b.eq level_el3
 	cmp x0, #2
 	b.eq level_el2
-	cmp x0, #1
 	b init_kernel_sp
 	
 level_el3:
-	mov x1, #(1<<1024)
+	ldr x1, =0x401
 	msr scr_el3, x1
 
 	mov x1, #0b00101
@@ -34,7 +33,7 @@ level_el3:
 	eret
 
 level_el2:
-	mov x1, #(1<<31)
+	ldr x1, =0x80000000
 	msr hcr_el2, x1
 
 	mov x1, #0b00101
@@ -46,11 +45,11 @@ level_el2:
 	eret
 
 init_kernel_sp:
-	ldr x0, =_stack_top
+	ldr x0, = __stack_top
 	mov sp, x0
 
-	ldr x1, = _bss_start
-	ldr x2, = _bss_end
+	ldr x1, = __bss_start
+	ldr x2, = __bss_end
 
 clear_bss:
 	cmp x1, x2

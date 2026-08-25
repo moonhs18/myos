@@ -1,36 +1,45 @@
-CC = gcc
-LD = ld
+CROSS_COMPILE ?= aarch64-linux-gnu-
+CC		:= $(CROSS_COMPILE)gcc
+AS		:= $(CROSS_COMPILE)gcc
+LD		:= $(CROSS_COMPILE)ld
 
-CFLAGS = -m32 \
-         -ffreestanding \
-         -fno-pie \
-         -fno-stack-protector \
-         -nostdlib \
-         -nostdinc \
-         -Wall \
-         -Wextra
+QEMU	:= qemu-system-aarch64
 
-all: myos.iso
+CFLAGS	:= -Wall -Wextra -O2 -ffreestanding -nostdlib -nostartfiles -Iuart -Ikernel
+ASFLAGS	:= -Wall -ffreestanding -nostdlib
+LDFLAGS	:= -T linker.ld -nostdlib --no-warn-rwx-segments
 
-boot.o:
-	$(CC) -m32 -c boot/boot.s -o boot.o
+BUILD_DIR	:= build
+TARGET_ELF	:= $(BUILD_DIR)/kernel.elf
 
-kernel.o:
-	$(CC) $(CFLAGS) -c kernel/kernel.c -o kernel.o
+SRCS_C	:= kernel/kernel.c uart/uart.c
+SRCS_S	:= boot/boot.s
 
-kernel.bin: boot.o kernel.o
-	$(LD) -m elf_i386 -T linker.ld -o kernel.bin boot.o kernel.o
+OBJS	:= 	$(patsubst %.c, $(BUILD_DIR)/%.o, $(SRCS_C)) \
+			$(patsubst %.s, $(BUILD_DIR)/%.o, $(SRCS_S))
 
-myos.iso: kernel.bin
-	mkdir -p iso/boot/grub
-	cp kernel.bin iso/boot/kernel.bin
-	cp grub/grub.cfg iso/boot/grub/grub.cfg
-	grub-mkrescue -o myos.iso iso
+.PHONY: all run debug clean
 
-run: myos.iso
-	qemu-system-i386 -cdrom myos.iso
+all: $(TARGET_ELF)
+
+$(TARGET_ELF): $(OBJS) linker.ld
+		@mkdir -p $(dir $@)
+		$(LD) $(LDFLAGS) -o $@ $(OBJS)
+
+$(BUILD_DIR)/%.o: %.c
+		@mkdir -p $(dir $@)
+		$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/%.o: %.s
+		@mkdir -p $(dir $@)
+		$(AS) $(ASFLAGS) -c $< -o $@
+
+run: $(TARGET_ELF)
+		$(QEMU) -M virt -cpu cortex-a53 -nographic -serial mon:stdio -kernel $(TARGET_ELF)
+
+debug: $(TARGET_ELF)
+		$(QEMU) -M virt -cpu cortex-a53 -nographic -serial mon:stdio -kernel $(TARGET_ELF) -s -S
+
 
 clean:
-	rm -f boot.o kernel.o kernel.bin myos.iso
-	rm -f iso/boot/kernel.bin
-	rm -f iso/boot/grub/grub.cfg
+		rm -rf $(BUILD_DIR)

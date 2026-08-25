@@ -26,19 +26,19 @@ SECTIONS
 
     .bss : ALIGN(16)
     {
-        _bss_start = .;
+        __bss_start = .;
         *(.bss*)
         *(COMMON)
         . = ALIGN(16);
-        _bss_end = .;
+        __bss_end = .;
     }
 
     .stack : ALIGN(16)
     {
-        _stack_bottom = .;
-        .+= 0x10000;
-        _stack_top = .;
+        __stack_bottom = .;
+        . = . + 0x10000;
+        __stack_top = .;
     }
 
-    _kernel_end = .;
+    __kernel_end = .;
 }
