@@ -12,8 +12,8 @@ LDFLAGS	:= -T linker.ld -nostdlib --no-warn-rwx-segments
 BUILD_DIR	:= build
 TARGET_ELF	:= $(BUILD_DIR)/kernel.elf
 
-SRCS_C	:= kernel/kernel.c uart/uart.c
-SRCS_S	:= boot/boot.s
+SRCS_C	:= kernel/kernel.c kernel/exception.c uart/uart.c
+SRCS_S	:= boot/boot.s boot/vector.s
 
 OBJS	:= 	$(patsubst %.c, $(BUILD_DIR)/%.o, $(SRCS_C)) \
 			$(patsubst %.s, $(BUILD_DIR)/%.o, $(SRCS_S))
