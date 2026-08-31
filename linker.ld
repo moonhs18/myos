@@ -9,10 +9,15 @@ SECTIONS
     {
         *(.text.boot)
     }
+    .text.vector : ALIGN(2048)
+    {
+        *(.text.vector)
+    }
     .text : ALIGN(4K)
     {
-        *(.text*)
+        *(.text)
     }
+
 
     .rodata : ALIGN(4K)
     {
@@ -39,6 +44,8 @@ SECTIONS
         . = . + 0x10000;
         __stack_top = .;
     }
-
+    
+    . = ALIGN(4K);
     __kernel_end = .;
+
 }

@@ -1,5 +1,5 @@
 [Phase 1: Boot & I/O] ──► [Phase 2: Exception] ──► [Phase 3: Memory (MMU)]
-(부트/스택/UART) [완료]    (벡터테이블/패닉덤프)      (PMM / kmalloc / 페이징)
+(부트/스택/UART) [완료]    (벡터테이블/패닉덤프) [완료] (PMM / kmalloc / 페이징)
                                                               │
                                                               ▼
 [Phase 6: User Mode]  ◄── [Phase 5: Scheduling] ◄── [Phase 4: Interrupt]
