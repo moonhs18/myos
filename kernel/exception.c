@@ -12,6 +12,7 @@ static const char* decode_exception_class(uint64_t ec){
     switch(ec){
         case 0x00: return "Unknown Reason";
         case 0x01: return "Trapped WFI/WFE Instruction";
+        case 0x07: return "Trapped Access to SVE/Advanced SIMD/FP (FPU Trap)";
         case 0x0E: return "Illegal  Execution state";
         case 0x15: return "SVC Instruction Execution (Syscall AArch64)";
         case 0x20: return "Instruction Abort (Lower EL)";
