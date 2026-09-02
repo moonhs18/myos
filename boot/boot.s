@@ -45,7 +45,7 @@ level_el2:
 	eret
 
 init_kernel_sp:
-	mov x0, #(3<<20) // fcu/neon disable
+	mov x0, #(3<<20) // fcu/neon disable		
 	msr cpacr_el1, x0
 	isb
 

@@ -6,7 +6,8 @@ LD		:= $(CROSS_COMPILE)ld
 QEMU	:= qemu-system-aarch64
 QFLAGS	:= -M virt -cpu cortex-a53 -nographic -serial mon:stdio
 
-CFLAGS	:= -Wall -Wextra -O2 -ffreestanding -nostdlib -nostartfiles -mgeneral-regs-only -Iuart -Ikernel -Itest -Ipmm -Iheap
+CFLAGS	:= -Wall -Wextra -O2 -ffreestanding -nostdlib -nostartfiles -mgeneral-regs-only \
+			-Iuart -Ikernel -Itest -Ipmm -Iheap -Immu
 ASFLAGS	:= -Wall -ffreestanding -nostdlib
 LDFLAGS	:= -T linker.ld -nostdlib --no-warn-rwx-segments
 
@@ -18,8 +19,9 @@ endif
 BUILD_DIR	:= build
 TARGET_ELF	:= $(BUILD_DIR)/kernel.elf
 
-SRCS_C	:= kernel/kernel.c kernel/exception.c uart/uart.c pmm/pmm.c heap/heap.c test/test_exception.c test/test_pmm.c test/test_heap.c
-SRCS_S	:= boot/boot.s boot/vector.s
+SRCS_C	:= kernel/kernel.c kernel/exception.c uart/uart.c pmm/pmm.c heap/heap.c mmu/mmu.c \
+			test/test_exception.c test/test_pmm.c test/test_heap.c test/test_mmu.c
+SRCS_S	:= boot/boot.s boot/vector.s mmu/mmu_enable.s
 
 OBJS	:= 	$(patsubst %.c, $(BUILD_DIR)/%.o, $(SRCS_C)) \
 			$(patsubst %.s, $(BUILD_DIR)/%.o, $(SRCS_S))

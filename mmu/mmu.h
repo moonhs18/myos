@@ -35,6 +35,11 @@ void mmu_init(void);
 void mmu_map_page(uint64_t *l0_table, uint64_t va, uint64_t pa, uint64_t flags);
 void mmu_map_range(uint64_t *l0_table, uint64_t va_start, uint64_t pa_start, size_t size, uint64_t flags);
 
+uint64_t *mmu_get_root_table(void);
+uint64_t mmu_translate(uint64_t *l0_table, uint64_t va);
+void mmu_tlb_flush(void);
+
+
 extern void arm64_mmu_enable(uint64_t l0_table_pa);
 
 #endif
