@@ -104,6 +104,9 @@ void mmu_init(void){
     
     //UART MMIO mapping
     mmu_map_range(l0_root, 0x09000000, 0x09000000, 0x10000, MMU_FLAG_DEVICE);
+    
+    ////GICv2 mapping
+    mmu_map_range(l0_root, 0x08000000, 0x08000000, 0x20000, MMU_FLAG_DEVICE);
 
     //kernel ram identity mapping 
     mmu_map_range(l0_root, RAM_START, RAM_START, RAM_SIZE, MMU_FLAG_RAM);
