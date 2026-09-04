@@ -1,11 +1,14 @@
 #include <exception.h>
 #include <uart.h>
+#include <gic.h>
+#include <timer.h>
 
 extern char exception_vector_table[];
 
 void exception_init(void)
 {
-    asm volatile("msr vbar_el1, %0" : : "r"(exception_vector_table));
+    asm volatile("msr vbar_el1, %0" : : "r"(exception_vector_table) : "memory");
+    asm volatile("isb");
 }
 
 static const char* decode_exception_class(uint64_t ec){
@@ -66,23 +69,34 @@ void handle_el1_sync(trap_frame_t *tf, uint64_t esr, uint64_t far){
 }
 
 void handle_el1_irq(void){
-    uart_puts("[IRQ] EL1 Kernel Interrupt Triggered!\n");
+    //to get irq_it
+    uint32_t irq_id = gic_acknowledge_irq();
+    
+    
+
+    if(irq_id >= 1020){
+        return;
+    }
+    if(irq_id == IRQ_TIMER_PHYS_NS){
+        timer_handle_irq();
+    }
+
+    gic_end_of_irq(irq_id);
 }
 
 void handle_lower_sync(trap_frame_t *tf, uint64_t esr, uint64_t far){
-    uint64_t ec = (esr >> 26) & 0x3f;
+    uint64_t ec = (esr >> 26) & 0x3F;
     if(ec == 0x15){
         uart_puts("[SYSCALL] System Call Invoked from User Mode!\n");
         return;
     }
-
-
     print_panic_dump(tf, esr, far, "User Space (EL0) Exception\n");
     while(1);
 }
 
 void handle_lower_irq(void){
     uart_puts("[IRQ] User Space Interrupt Triggered!\n");
+    handle_el1_irq();
 }
 
 void handle_unknown_exception(trap_frame_t *tf, uint64_t esr, uint64_t far){

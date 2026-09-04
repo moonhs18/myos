@@ -1,5 +1,4 @@
 #include "gic.h"
-#include "uart.h"
 
 
 //32bits MMIO memory access helper
@@ -22,11 +21,20 @@ void gic_init(void){
 
     //disable all of the Interrupt
     for(int i=0;i<4;i++){
-        mmio_write32(GICD_BASE + GICD_CTLR + (i * 4), 0xFFFFFFFF);
+        mmio_write32(GICD_BASE + GICD_ICENABLER + (i * 4), 0xFFFFFFFF);
     }
-    //Initialize CPU interface
-    mmio_write32(GICC_BASE + GICC_CTLR, 0xFF);
 
+    for(int i=0;i<4;i++){
+        mmio_write32(GICD_BASE + GICD_IGROUPR + (i * 4), 0xFFFFFFFF);
+    }
+
+    //enable distributor
+    mmio_write32(GICD_BASE + GICD_CTLR, 1);
+
+    //cpu interface priority
+    mmio_write32(GICC_BASE + GICC_PMR, 0xFF);
+
+    //cpu interface enable
     mmio_write32(GICC_BASE + GICC_CTLR, 1);
 }
 
@@ -44,6 +52,15 @@ void gic_enable_interrupt(uint32_t irq_id){
     mmio_write32(GICD_BASE + GICD_ISENABLER + (reg_idx * 4), (1U << bit_offset));
 }
 
+//If interrupt occured > IRQ Num check
+uint32_t gic_acknowledge_irq(void){
+    return mmio_read32(GICC_BASE + GICC_IAR) & 0x3FF;
+}
+
+//End of Interrupt
+void gic_end_of_irq(uint32_t irq_id){
+    mmio_write32(GICC_BASE + GICC_EOIR, irq_id);
+}
 
 
 

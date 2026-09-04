@@ -12,10 +12,20 @@ typedef struct{
 } trap_frame_t;
 
 void exception_init(void);
-void handler_el1_sync(trap_frame_t *tf, uint64_t esr, uint64_t far);
-void handler_el1_irq(void);
-void handler_lower_sync(trap_frame_t *tf, uint64_t esr, uint64_t far);
-void handler_lower_irq(void);
-void handler_unknown_exception(trap_frame_t *tf, uint64_t esr, uint64_t far);
+
+static inline void enable_irq(void){
+    asm volatile("msr daifclr, #2" ::: "memory");//Bit 1 (I bit) clear -> enable IRQ
+
+}
+
+static inline void disable_irq(void){
+    asm volatile("msr daifset, #2" ::: "memory");//Bit 1 (I bit) set  -> disable IRQ
+}
+
+void handle_el1_sync(trap_frame_t *tf, uint64_t esr, uint64_t far);
+void handle_el1_irq(void);
+void handle_lower_sync(trap_frame_t *tf, uint64_t esr, uint64_t far);
+void handle_lower_irq(void);
+void handle_unknown_exception(trap_frame_t *tf, uint64_t esr, uint64_t far);
 
 #endif

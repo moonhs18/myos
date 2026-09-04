@@ -23,8 +23,8 @@
     stp x28, x29, [sp, #16 * 14]
     stp x26, x27, [sp, #16 * 13]
 
-    mrs x21, elr_el1
-    mrs x22, spsr_el1
+    mrs x21, spsr_el1
+    mrs x22, elr_el1
     stp x30, x21, [sp, #16 * 15]
     str x22, [sp, #16 * 16]
 .endm
@@ -32,8 +32,8 @@
 .macro kernel_exit
     ldr x22, [sp, #16 * 16]
     ldp x30, x21, [sp, #16 * 15]
-    msr spsr_el1, x22
-    msr elr_el1, x21
+    msr elr_el1, x22
+    msr spsr_el1, x21
     
     ldp x28, x29, [sp, #16 * 14]
     ldp x26, x27, [sp, #16 * 13]

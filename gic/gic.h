@@ -9,6 +9,7 @@
 // GICD(Distributor) register offset
 #define GICD_CTLR       0x000   //Distributor Control
 #define GICD_TYPER      0x004   //Controller Type
+#define GICD_IGROUPR    0x080   //Interrupt Group Register
 #define GICD_ISENABLER  0x100   //Interrupt Set-enable
 #define GICD_ICENABLER  0x180   //Interrupt Clear-enable
 #define GICD_IPRIORITYR 0x400   //Interrupt Priority
@@ -26,7 +27,7 @@
 void gic_init(void);
 void gic_enable_interrupt(uint32_t irq_id);
 uint32_t gic_acknowledge_irq(void);
-void gic_end_if_irq(uint32_t irq_id);
+void gic_end_of_irq(uint32_t irq_id);
 
 
 #endif

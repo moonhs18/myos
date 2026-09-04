@@ -3,6 +3,8 @@
 #include "pmm.h"
 #include "heap.h"
 #include "mmu.h"
+#include "gic.h"
+#include "timer.h"
 
 #ifdef ENABLE_TESTS
 #include "test.h"
@@ -36,11 +38,24 @@ void kernel_main(void) {
     test_heap_allocator();
     test_mmu_virtual_memory();
 #endif
+    
+    gic_init();
+    uart_puts("[OK] GICv2 Interrupt Controller Initialized.\n");
+
+    timer_init(100);
+    uart_puts("[OK] ARM Generic Timer Initialized.\n");
+    
+    enable_irq();
+    uart_puts("[OK] CPU Global Interrupts Unmasked.\n");
+
+#ifdef ENABLE_TESTS
+    test_timer_ticks();
+#endif
     uart_puts(">> Kernel is now in idle state.\n");
 
     while (1)
     {
-        asm volatile("wfe");
+        asm volatile("wfi");
     }
 
 }
