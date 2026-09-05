@@ -29,19 +29,25 @@ void gic_init(void){
     }
 
     //enable distributor
-    mmio_write32(GICD_BASE + GICD_CTLR, 1);
+    mmio_write32(GICD_BASE + GICD_CTLR, 0x3);
 
     //cpu interface priority
     mmio_write32(GICC_BASE + GICC_PMR, 0xFF);
 
     //cpu interface enable
-    mmio_write32(GICC_BASE + GICC_CTLR, 1);
+    mmio_write32(GICC_BASE + GICC_CTLR, 0x7);
 }
 
 void gic_enable_interrupt(uint32_t irq_id){
     //Set prority
     //0x80 => middle priority
-    mmio_write8(GICD_BASE + GICD_IPRIORITYR + irq_id, 0x80);
+    uint32_t prio_reg = GICD_BASE + GICD_IPRIORITYR + (irq_id & ~0x3U);
+    uint32_t shift = (irq_id % 4) * 8;
+    uint32_t val = mmio_read32(prio_reg);
+    val &= ~(0xFFU << shift);
+    val |= (0x80U << shift);
+    mmio_write32(prio_reg, val);
+
     if(irq_id >=32){
         mmio_write8(GICD_BASE + GICD_ITARGETSR + irq_id, 0x01);
     }

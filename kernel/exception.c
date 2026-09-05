@@ -71,8 +71,6 @@ void handle_el1_sync(trap_frame_t *tf, uint64_t esr, uint64_t far){
 void handle_el1_irq(void){
     //to get irq_it
     uint32_t irq_id = gic_acknowledge_irq();
-    
-    
 
     if(irq_id >= 1020){
         return;
