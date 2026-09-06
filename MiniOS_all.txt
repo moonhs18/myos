@@ -1,0 +1,1519 @@
+===== ./kernel/kernel.c =====
+#include "uart.h"
+#include "exception.h"
+#include "pmm.h"
+#include "heap.h"
+#include "mmu.h"
+#include "gic.h"
+#include "timer.h"
+
+#ifdef ENABLE_TESTS
+#include "test.h"
+#endif
+
+extern char __stack_top[];
+extern char __kernel_end[];
+
+void kernel_main(void) {
+    
+    uart_init();
+    uart_puts("\n=======================================\n");
+    uart_puts("  MiniOS (ARM64) Successfully Booted!  \n");
+    uart_puts("=======================================\n");
+
+    exception_init();
+    uart_puts("[OK] Exception Vector Table Registered.\n");
+
+    pmm_init();
+    uart_puts("[OK] Physical Memory Manager (PMM) Initialized.\n");
+
+    heap_init();
+    uart_puts("[OK] Kernel Heap Allocator (kmalloc) Initialized.\n");
+
+    mmu_init();
+    uart_puts("[OK] ARM64 MMU & 4-Level Paging Activated.\n");
+
+#ifdef ENABLE_TESTS
+    uart_puts(">> Running Unit Tests...\n");
+    test_pmm_allocator();
+    test_heap_allocator();
+    test_mmu_virtual_memory();
+#endif
+    
+    gic_init();
+    uart_puts("[OK] GICv2 Interrupt Controller Initialized.\n");
+
+    timer_init(100);
+    uart_puts("[OK] ARM Generic Timer Initialized.\n");
+    
+    enable_irq();
+    uart_puts("[OK] CPU Global Interrupts Unmasked.\n");
+
+#ifdef ENABLE_TESTS
+    test_timer_ticks();
+#endif
+    uart_puts(">> Kernel is now in idle state.\n");
+
+    while (1)
+    {
+        asm volatile("wfi");
+    }
+
+}
+===== ./kernel/exception.h =====
+#ifndef EXCEPTION_H
+#define EXCEPTION_H
+
+#include <stdint.h>
+
+typedef struct{
+    uint64_t x[30]; //240B
+    uint64_t lr; //8B
+    uint64_t elr_el1; //8B
+    uint64_t spsr_el1;//8B
+    uint64_t unused; //to packing for 272B 
+} trap_frame_t;
+
+void exception_init(void);
+
+static inline void enable_irq(void){
+    asm volatile("msr daifclr, #2" ::: "memory");//Bit 1 (I bit) clear -> enable IRQ
+
+}
+
+static inline void disable_irq(void){
+    asm volatile("msr daifset, #2" ::: "memory");//Bit 1 (I bit) set  -> disable IRQ
+}
+
+void handle_el1_sync(trap_frame_t *tf, uint64_t esr, uint64_t far);
+void handle_el1_irq(void);
+void handle_lower_sync(trap_frame_t *tf, uint64_t esr, uint64_t far);
+void handle_lower_irq(void);
+void handle_unknown_exception(trap_frame_t *tf, uint64_t esr, uint64_t far);
+
+#endif
+===== ./kernel/exception.c =====
+#include <exception.h>
+#include <uart.h>
+#include <gic.h>
+#include <timer.h>
+
+extern char exception_vector_table[];
+
+void exception_init(void)
+{
+    asm volatile("msr vbar_el1, %0" : : "r"(exception_vector_table) : "memory");
+    asm volatile("isb");
+}
+
+static const char* decode_exception_class(uint64_t ec){
+    switch(ec){
+        case 0x00: return "Unknown Reason";
+        case 0x01: return "Trapped WFI/WFE Instruction";
+        case 0x07: return "Trapped Access to SVE/Advanced SIMD/FP (FPU Trap)";
+        case 0x0E: return "Illegal  Execution state";
+        case 0x15: return "SVC Instruction Execution (Syscall AArch64)";
+        case 0x20: return "Instruction Abort (Lower EL)";
+        case 0x21: return "Instruction Abort (Current EL)";
+        case 0x22: return "PC Alignment Falult";
+        case 0x24: return "Data Abort (Lower EL)";
+        case 0x25: return "Data Abort (Current EL - Invalid Memory Access)";
+        case 0x26: return "SP Alignment Fault";
+        default:   return "Reversed / Unhandled Exception Class";
+    }
+}
+
+static void print_panic_dump(trap_frame_t *tf, uint64_t esr, uint64_t far, const char *title){
+    uint64_t ec = (esr >> 26) & 0x3F;
+
+    uart_puts("\n=======================================================\n");
+    uart_puts("                 [KERNEL PANIC OCCUREED]               \n");
+    uart_puts("=======================================================\n");
+    uart_puts("Type                 :"); uart_puts(title); uart_puts("\n");
+    uart_puts("Faulting PC (ELR)    :"); uart_put_hex(tf->elr_el1); uart_puts("\n");
+    uart_puts("Fault Address (FAR)  :"); uart_put_hex(far); uart_puts("\n");
+    uart_puts("Syndrome (ESR)       :"); uart_put_hex(esr); uart_puts("\n");
+    uart_puts("Class Description    :"); uart_puts(decode_exception_class(ec)); uart_puts("\n\n");
+
+    uart_puts("--- General Purpose Register (Trap Frame Dump) ----\n");
+    for(int i = 0;i < 30;i += 2){
+        uart_puts("X");
+        if(i < 10) uart_putc('0' + i);
+        else {uart_putc('0' + (i/10)); uart_putc('0' + (i%10));}
+        uart_puts(": ");
+        uart_put_hex(tf->x[i]);
+
+        uart_puts("    X");
+        if((i+1) < 10) uart_putc('0' + (i+1));
+        else {uart_putc('0' + ((i+1) / 10)); uart_putc('0' + ((i+1) % 10));}
+        uart_puts(": ");
+        uart_put_hex(tf->x[i+1]);
+        uart_puts("\n");
+    }
+    uart_puts("LR (X30) : "); uart_put_hex(tf->lr);
+    uart_puts("   SPSR_EL1: "); uart_put_hex(tf->spsr_el1);
+    uart_puts("\n=======================================================\n");
+}
+
+void handle_el1_sync(trap_frame_t *tf, uint64_t esr, uint64_t far){
+    print_panic_dump(tf, esr, far, "Synchronous Exception inside Kernel (EL1)");
+    while (1)
+    {
+        asm volatile("wfe");
+    }
+}
+
+void handle_el1_irq(void){
+    //to get irq_it
+    uint32_t irq_id = gic_acknowledge_irq();
+
+    if(irq_id >= 1020){
+        return;
+    }
+    if(irq_id == IRQ_TIMER_PHYS_NS){
+        timer_handle_irq();
+    }
+
+    gic_end_of_irq(irq_id);
+}
+
+void handle_lower_sync(trap_frame_t *tf, uint64_t esr, uint64_t far){
+    uint64_t ec = (esr >> 26) & 0x3F;
+    if(ec == 0x15){
+        uart_puts("[SYSCALL] System Call Invoked from User Mode!\n");
+        return;
+    }
+    print_panic_dump(tf, esr, far, "User Space (EL0) Exception\n");
+    while(1);
+}
+
+void handle_lower_irq(void){
+    uart_puts("[IRQ] User Space Interrupt Triggered!\n");
+    handle_el1_irq();
+}
+
+void handle_unknown_exception(trap_frame_t *tf, uint64_t esr, uint64_t far){
+    print_panic_dump(tf, esr, far, "Unknown / Unexpected Trap Vector");
+    while(1);
+}
+
+===== ./test/test_exception.c =====
+#include "uart.h"
+#include <stdint.h>
+
+void test_exception_abort(void){
+    uart_puts("\n[TEST]------------------------------------\n");
+    uart_puts("\n[TEST] Triggering Intentional Data Abort...\n");
+    uart_puts("\n[TEST]------------------------------------\n");
+
+    volatile uint64_t *invalid_addr = (volatile uint64_t *)0XDEADBEEF0000;
+    *invalid_addr = 0X12345678;
+
+    uart_puts("[FAIL] This message must NOT be printed.\n");
+}
+===== ./test/test_timer.c =====
+#include "test.h"
+#include "timer.h"
+#include "uart.h"
+
+void test_timer_ticks(void) {
+    uart_puts("\n[TEST] ================================================\n");
+    uart_puts("[TEST]    Starting Hardware Timer & GICv2 Unit Tests   \n");
+    uart_puts("[TEST] ================================================\n");
+
+    uint64_t start_tick = timer_get_ticks();
+    uart_puts("[TEST] Waiting for 10 Timer Ticks (~100ms)...\n");
+
+    // 10틱(약 100ms) 대기
+    timer_sleep_ticks(10);
+    
+
+    uint64_t end_tick = timer_get_ticks();
+    uart_puts("[TEST] Start Tick: ");
+    uart_put_hex(start_tick);
+    uart_puts(" -> End Tick: ");
+    uart_put_hex(end_tick);
+    uart_puts("\n");
+
+    if (end_tick >= start_tick + 10) {
+        uart_puts("[TEST] [PASS] Hardware Timer & Interrupt Processing OK!\n");
+    } else {
+        uart_puts("[TEST] [FAIL] Timer Ticks did not increase properly!\n");
+    }
+    uart_puts("=======================================================\n\n");
+}
+===== ./test/test.h =====
+#ifndef TEST_H
+#define TEST_H
+
+void test_exception_abort(void);
+void test_pmm_allocator(void);
+void test_heap_allocator(void);
+void test_mmu_virtual_memory(void);
+void test_timer_ticks(void);
+
+#endif
+===== ./test/test_pmm.c =====
+#include "test.h"
+#include "pmm.h"
+#include "uart.h"
+
+void test_pmm_allocator(void){
+    uart_puts("\n[TEST] --- starting PMM Unit Tests --- \n");
+
+    uint64_t initial_free = pmm_get_free_pages();
+    uart_puts("[TEST] Initial Free pages:");
+    uart_put_hex(initial_free);
+    uart_puts("\n");
+
+    void *page1 = pmm_alloc_page();
+    void *page2 = pmm_alloc_page();
+
+    uart_puts("[TEST] Allocated page 1: ");
+    uart_put_hex((uint64_t)page1);
+    uart_puts("\n");
+
+    uart_puts("[TEST] Allocated page 2: ");
+    uart_put_hex((uint64_t)page2);
+    uart_puts("\n");
+
+    pmm_free_page(page1);
+    void *page1_realloc = pmm_alloc_page();
+    uart_puts("[TEST] Re-allocated page: ");
+    uart_put_hex((uint64_t)page1_realloc);
+    uart_puts(" (Expected same as Page 1)\n");
+
+
+    void *multi_pages = pmm_alloc_pages(4);
+    uart_puts("[TEST] Allocated 4 pages: ");
+    uart_put_hex((uint64_t)multi_pages);
+    uart_puts("\n");
+
+    pmm_free_pages(multi_pages, 4);
+    pmm_free_page(page2);
+    pmm_free_page(page1_realloc);
+
+    uint64_t final_free = pmm_get_free_pages();
+    uart_puts("[TEST] Final Free Pages  : ");
+    uart_put_hex(final_free);
+    uart_puts("\n");
+
+    if (initial_free == final_free) {
+        uart_puts("[TEST] [PASS] PMM All Tests Passed Successfully!\n\n");
+    } else {
+        uart_puts("[TEST] [FAIL] Memory Leak Detected in PMM!\n\n");
+    }
+
+}
+===== ./test/test_heap.c =====
+#include "test.h"
+#include "heap.h"
+#include "uart.h"
+
+void test_heap_allocator(void){
+    uart_puts("\n[TEST] --- Starting Kernel Heap (kmalloc/kfree) Unit Tests --- \n");
+
+    void *ptr1 = kmalloc(32);
+    void *ptr2 = kmalloc(128);
+    void *ptr3 = kmalloc(512);
+
+    uart_puts("[TEST] kmalloc(32) Address: ");
+    uart_put_hex((uint64_t)ptr1);
+    uart_puts("\n");
+   
+    uart_puts("[TEST] kmalloc(128) Address: ");
+    uart_put_hex((uint64_t)ptr2);
+    uart_puts("\n");
+    
+    uart_puts("[TEST] kmalloc(512) Address: ");
+    uart_put_hex((uint64_t)ptr3);
+    uart_puts("\n");
+
+    uint8_t *byte_arr = (uint8_t *)ptr1;
+    for(int i = 0; i < 32; i++){
+        byte_arr[i] = (uint8_t)(0xAA + i);
+    }
+    
+    int read_ok = 1;
+    for(int i = 0; i < 32; i++){
+        if(byte_arr[i] != (uint8_t)(0xAA + i)){
+            read_ok = 0;
+            break;
+        }
+    }
+    if(read_ok){
+        uart_puts("[TEST] Data Write/Read Test : PASS\n");
+    }
+    else{
+        uart_puts("[TEST] Data Write/Read Test : FAIL\n");
+    }
+
+    kfree(ptr1);
+    kfree(ptr2);
+    kfree(ptr3);
+
+    void *ptr_merged = kmalloc(600);
+    uart_puts("[TEST] kmalloc(600) (Reused): ");
+    uart_put_hex((uint64_t)ptr_merged);
+    uart_puts(" (Expected start near ptr1)\n");
+
+    kfree(ptr_merged);
+    uart_puts("[TEST] [PASS] Heap Allocator Tests Completed Successfully!\n\n");
+
+}
+===== ./test/test_mmu.c =====
+#include <test.h>
+#include <mmu.h>
+#include <pmm.h>
+#include <uart.h>
+
+static void print_subtest(const char *name, int pass){
+    uart_puts("  ->  ");
+    uart_puts(name);
+    if(pass)    uart_puts(": [PASS]\n");
+    else        uart_puts(": [FAIL]\n");
+}
+
+
+
+void test_mmu_virtual_memory(void){
+    uart_puts("\n[TEST] ================================================\n");
+    uart_puts("[TEST]       Starting Comprehensive MMU Unit Tests     \n");
+    uart_puts("[TEST] ================================================\n");
+
+    uint64_t *root = mmu_get_root_table();
+    int overall_pass = 1;
+
+    //page table walk test
+    uart_puts("[1] Page Table Hardware Walk Test\n\n");
+
+    uint64_t pa_ram = mmu_translate(root, 0x40000000);
+    uint64_t pa_uart = mmu_translate(root, 0x09000000);                                      
+    uint64_t pa_unmapped = mmu_translate(root, 0x55000000);
+    
+
+    int test1_ok = (pa_ram == 0x40000000) && (pa_uart == 0x09000000) && (pa_unmapped == 0);
+
+    print_subtest("RAM/UART Translation & Unmapped Space Detection", test1_ok);
+    if (!test1_ok) overall_pass = 0;
+
+
+    //Non Identity mapping test
+    uart_puts("[2] Non-Identity Dynamic Mapping Test (VA != PA)\n");
+    void *phys_frame = pmm_alloc_page();
+    uint64_t test_va = 0x50000000ULL;
+
+    mmu_map_page(root, test_va, (uint64_t)phys_frame, MMU_FLAG_RAM);
+    
+
+    mmu_tlb_flush();
+
+    *(volatile uint64_t *)test_va = 0xFEEDC0FFEE123456ULL;
+    
+    uint64_t direct_read = *(volatile uint64_t *)phys_frame;
+    int test2_ok = (direct_read == 0xFEEDC0FFEE123456ULL);
+
+    *(volatile uint64_t *)phys_frame = 0xABCDEF0123456789ULL;
+    if (*(volatile uint64_t *)test_va != 0xABCDEF0123456789ULL) {
+        test2_ok = 0;
+    }
+    print_subtest("Bi-directional Translation Consistency (VA <-> PA)", test2_ok);
+    if (!test2_ok) overall_pass = 0;
+
+    // stress test for crossing 4KB page boundaries
+    uart_puts("[3] Multi-Page Boundary Stress Test\n");
+    void *multi_phys = pmm_alloc_pages(2);
+    uint64_t multi_va = 0x60000000ULL;
+
+    mmu_map_range(root, multi_va, (uint64_t)multi_phys, PAGE_SIZE * 2, MMU_FLAG_RAM);
+    mmu_tlb_flush();
+
+    volatile uint64_t *cross_boundary_ptr = (volatile uint64_t *)(multi_va + PAGE_SIZE - 4);
+    *cross_boundary_ptr = 0xAABBCCDDEEFF0011ULL;
+
+    int test3_ok = (*cross_boundary_ptr == 0xAABBCCDDEEFF0011ULL);
+    print_subtest("Cross-Page Boundary 64-bit Memory Access", test3_ok);
+    if (!test3_ok) overall_pass = 0;
+
+
+    //page remapping and TLB invalidation
+    uart_puts("[4] Dynamic Remapping & TLB Invalidation Test\n");
+    void *new_phys = pmm_alloc_page();
+    *(volatile uint64_t *)new_phys = 0x777788889999AAAAULL;
+
+    mmu_map_page(root, test_va, (uint64_t)new_phys, MMU_FLAG_RAM);
+    mmu_tlb_flush();
+
+    int test4_ok = (*(volatile uint64_t *)test_va == 0x777788889999AAAAULL);
+    print_subtest("TLB Flush and Remapped Page Visibility", test4_ok);
+    if (!test4_ok) overall_pass = 0;
+
+
+    //resource deallocation and cleanup
+    pmm_free_page(phys_frame);
+    pmm_free_pages(multi_phys, 2);
+    pmm_free_page(new_phys);
+
+    uart_puts("-------------------------------------------------------\n");
+    if (overall_pass) {
+        uart_puts("[TEST] [PASS] ALL MMU & PAGING TESTS COMPLETED SUCCESSFULLY!\n");
+    } else {
+        uart_puts("[TEST] [FAIL] MMU UNIT TESTS FAILED!\n");
+    }
+    uart_puts("=======================================================\n\n");
+
+}
+
+===== ./pmm/pmm.c =====
+#include "pmm.h"
+#include "uart.h"
+#include <stddef.h>
+
+
+extern char __kernel_end[];
+
+static uint64_t *bitmap = 0;
+static uint64_t total_pages = 0;
+static uint64_t bitmap_total_words = 0;
+static uint64_t usable_start_addr = 0;
+
+static inline void bitmap_set(uint64_t page_idx){
+    bitmap[page_idx/64] |= (1ULL << (page_idx % 64));
+}
+
+static inline void bitmap_clear(uint64_t page_idx){
+    bitmap[page_idx/64] &= ~(1ULL << (page_idx % 64));
+}
+
+static inline int bitmap_test(uint64_t page_idx){
+    return (bitmap[page_idx / 64] & (1ULL <<(page_idx % 64))) != 0; // it is in there = 1, if not =0
+}
+
+static void pmm_memzero(void *dst, size_t size){
+    uint8_t *p = (uint8_t *)dst;
+    while (size--)
+    {
+        *p++ = 0;
+    }
+    
+}
+
+void pmm_init(void){
+    total_pages = (RAM_END - RAM_START) / PAGE_SIZE;
+    bitmap_total_words = (total_pages + 63) / 64;
+    uint64_t bitmap_size_bytes = bitmap_total_words * 8;
+
+    //locate bitmap -> kernel_end
+    bitmap = (uint64_t *)(((uint64_t)__kernel_end + 7) & ~7ULL);
+    
+    //set all bits in the bitmap to 1
+    for (uint64_t i = 0; i < bitmap_total_words; i++){
+        bitmap[i] = ~0ULL;
+    }
+
+    uint64_t free_start  = (uint64_t)bitmap + bitmap_size_bytes;
+    usable_start_addr = (free_start + PAGE_SIZE -1) & ~(PAGE_SIZE - 1);
+
+    uint64_t start_page_idx = (usable_start_addr - RAM_START) / PAGE_SIZE; //to get page num
+    for(uint64_t i = start_page_idx; i<total_pages; i++){
+        bitmap_clear(i);
+    }
+}
+
+void *pmm_alloc_pages(uint64_t count){
+    if (count == 0) return 0;
+
+    uint64_t start_page_idx = (usable_start_addr - RAM_START) / PAGE_SIZE;
+    size_t found_count = 0;
+    uint64_t found_start_idx = 0;
+
+    for(uint64_t i = start_page_idx ; i < total_pages ; i++){
+        if(!bitmap_test(i)){//bitmap is empty(not allocated)
+            if(found_count == 0){
+                found_start_idx = i;
+            }
+            found_count++;
+            
+            if(found_count == count){ //allocation is done
+                for(uint64_t j = found_start_idx; j<found_start_idx + count ;j++){
+                    bitmap_set(j);
+                }
+                void *addr = (void *)(RAM_START + (found_start_idx * PAGE_SIZE));
+                pmm_memzero(addr, count * PAGE_SIZE);
+                return addr; //return start_allocation addr
+            }
+        }
+        else{//restart to find contiguous memory
+            found_count =0;
+        }
+    }        
+    return 0;
+}
+
+
+void *pmm_alloc_page(void){
+    return pmm_alloc_pages(1);
+}
+
+
+void pmm_free_pages(void *ptr, size_t count){
+    uint64_t addr = (uint64_t)ptr;
+
+    if(ptr == 0 || addr < usable_start_addr || addr >= RAM_END || (addr & (PAGE_SIZE - 1)) !=0){
+        return;
+    }
+
+    uint64_t page_idx = (addr - RAM_START) / PAGE_SIZE;
+    for(size_t i = 0; i<count ; i++){
+        if((page_idx + i) < total_pages){
+            bitmap_clear(page_idx + i);
+        }
+    }
+}
+
+void pmm_free_page(void *ptr){
+    return pmm_free_pages(ptr, 1);
+}
+
+uint64_t pmm_get_free_pages(void){
+    uint64_t free_cnt = 0;
+    uint64_t start_page_idx = (usable_start_addr - RAM_START) / PAGE_SIZE;
+    for(uint64_t i =start_page_idx; i < total_pages; i++){
+        if(!bitmap_test(i)){
+            free_cnt++;
+        }
+    }
+    return free_cnt;
+}
+
+
+===== ./pmm/pmm.h =====
+#ifndef PMM_H
+#define PMM_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+#define PAGE_SIZE   4096
+#define RAM_START   0x40000000
+#define RAM_SIZE    0x08000000
+#define RAM_END     (RAM_START + RAM_SIZE)
+
+
+void pmm_init(void);
+void *pmm_alloc_page(void);
+void *pmm_alloc_pages(size_t count);
+void pmm_free_page(void *ptr);
+void pmm_free_pages(void *ptr, size_t count);
+
+uint64_t pmm_get_free_pages(void);
+
+#endif
+===== ./heap/heap.c =====
+#include "heap.h"
+#include "pmm.h"
+#include "uart.h"
+
+static block_header_t *heap_start = 0;
+
+#define INITIAL_HEAP_PAGES 4
+
+void heap_init(void){
+    void *initial_mem = pmm_alloc_pages(INITIAL_HEAP_PAGES);
+    if(!initial_mem){
+        uart_puts("[HEAP ERROR] Failed to allocate physical memory for Heap!\n");
+        return;
+    }
+
+    heap_start = (block_header_t *)initial_mem;
+    heap_start->size = (INITIAL_HEAP_PAGES * PAGE_SIZE) - HEADER_SIZE;
+    heap_start->is_free = 1;
+    heap_start->next = 0;
+}
+
+
+void *kmalloc(size_t size){
+    if(size == 0) return 0;
+
+    size_t aligned_size = ALIGN_UP16(size);//aligned 16bytes
+    block_header_t *curr = heap_start;
+
+    while(curr){
+        if(curr->is_free && (curr->size) >= aligned_size){
+            if((curr->size) >= aligned_size + HEADER_SIZE + HEAP_ALIGNMENT){
+                block_header_t *new_block = (block_header_t *)((uint8_t *)curr + HEADER_SIZE + aligned_size);
+                new_block->size = curr->size - aligned_size - HEADER_SIZE;
+                new_block->is_free = 1;
+                new_block->next = curr->next;
+
+                curr->size = aligned_size;
+                curr->next = new_block;
+            }
+            curr->is_free = 0;
+
+            return (void *)((uint8_t *)curr + HEADER_SIZE);
+        }
+        curr = curr->next;
+    }
+
+    size_t pages_needed = (aligned_size + HEADER_SIZE + PAGE_SIZE - 1) / PAGE_SIZE;
+    void *new_pages = pmm_alloc_pages(pages_needed);
+    if(!new_pages){
+        uart_puts("[HEAP ERROR] Out of Memory in kmalloc!\n");
+        return 0;
+    }
+
+    block_header_t *expanded_block = (block_header_t *)new_pages;
+    expanded_block->size = (pages_needed * PAGE_SIZE) - HEADER_SIZE;
+    expanded_block->is_free=0;
+    expanded_block->next = 0;
+
+    curr = heap_start;
+    while (curr->next)
+    {
+        curr = curr->next;
+    }
+    curr->next = expanded_block;
+
+    return (void *)((uint8_t *)expanded_block + HEADER_SIZE);
+}
+
+void kfree(void *ptr){
+    if(!ptr) return;
+
+    block_header_t *header = (block_header_t *)((uint8_t *)ptr - HEADER_SIZE);
+    header->is_free = 1;
+
+    block_header_t *curr = heap_start;
+    while(curr && curr->next){
+        if(curr->is_free && curr->next->is_free){
+            if((uint8_t *)curr + HEADER_SIZE + curr->size == (uint8_t *)curr->next){
+                curr->size += HEADER_SIZE + curr->next->size;
+                curr->next = curr->next->next;
+                continue;
+            }
+        }
+        curr = curr->next;
+    }
+
+}
+===== ./heap/heap.h =====
+#ifndef HEAP_H
+#define HEAP_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+#define HEAP_ALIGNMENT 16
+#define ALIGN_UP16(size) (((size) + (HEAP_ALIGNMENT - 1)) & ~(HEAP_ALIGNMENT - 1))
+
+typedef struct block_header{
+    size_t size;
+    int is_free;
+    struct block_header *next;
+    uint64_t padding;
+} block_header_t;
+
+#define HEADER_SIZE (sizeof(block_header_t))
+
+void heap_init(void);
+void *kmalloc(size_t size);
+void kfree(void *ptr);
+
+#endif
+===== ./gic/gic.c =====
+#include "gic.h"
+
+
+//32bits MMIO memory access helper
+static inline void mmio_write32(uint64_t addr, uint32_t val){
+    *(volatile uint32_t*)addr = val;
+}
+
+static inline uint32_t mmio_read32(uint64_t addr){
+    return *(volatile uint32_t*)addr;
+}
+
+//8bits MMIO memory acceess helper to set priority
+static inline void mmio_write8(uint64_t addr, uint8_t val){
+    *(volatile uint8_t *)addr = val;
+}
+
+void gic_init(void){
+    //GICD disable for setting
+    mmio_write32(GICD_BASE + GICD_CTLR, 0);
+
+    //disable all of the Interrupt
+    for(int i=0;i<4;i++){
+        mmio_write32(GICD_BASE + GICD_ICENABLER + (i * 4), 0xFFFFFFFF);
+    }
+
+    for(int i=0;i<4;i++){
+        mmio_write32(GICD_BASE + GICD_IGROUPR + (i * 4), 0xFFFFFFFF);
+    }
+
+    //enable distributor
+    mmio_write32(GICD_BASE + GICD_CTLR, 0x3);
+
+    //cpu interface priority
+    mmio_write32(GICC_BASE + GICC_PMR, 0xFF);
+
+    //cpu interface enable
+    mmio_write32(GICC_BASE + GICC_CTLR, 0x7);
+}
+
+void gic_enable_interrupt(uint32_t irq_id){
+    //Set prority
+    //0x80 => middle priority
+    uint32_t prio_reg = GICD_BASE + GICD_IPRIORITYR + (irq_id & ~0x3U);
+    uint32_t shift = (irq_id % 4) * 8;
+    uint32_t val = mmio_read32(prio_reg);
+    val &= ~(0xFFU << shift);
+    val |= (0x80U << shift);
+    mmio_write32(prio_reg, val);
+
+    if(irq_id >=32){
+        mmio_write8(GICD_BASE + GICD_ITARGETSR + irq_id, 0x01);
+    }
+
+    //IRQ enable
+    uint32_t reg_idx = irq_id / 32;
+    uint32_t bit_offset = irq_id % 32;
+    mmio_write32(GICD_BASE + GICD_ISENABLER + (reg_idx * 4), (1U << bit_offset));
+}
+
+//If interrupt occured > IRQ Num check
+uint32_t gic_acknowledge_irq(void){
+    return mmio_read32(GICC_BASE + GICC_IAR) & 0x3FF;
+}
+
+//End of Interrupt
+void gic_end_of_irq(uint32_t irq_id){
+    mmio_write32(GICC_BASE + GICC_EOIR, irq_id);
+}
+
+
+
+
+===== ./gic/gic.h =====
+#ifndef GIC_H
+#define GIC_H
+
+#include <stdint.h>
+
+#define GICD_BASE 0x08000000ULL //Distributor base addr
+#define GICC_BASE 0x08010000ULL //CPU interface base addr
+
+// GICD(Distributor) register offset
+#define GICD_CTLR       0x000   //Distributor Control
+#define GICD_TYPER      0x004   //Controller Type
+#define GICD_IGROUPR    0x080   //Interrupt Group Register
+#define GICD_ISENABLER  0x100   //Interrupt Set-enable
+#define GICD_ICENABLER  0x180   //Interrupt Clear-enable
+#define GICD_IPRIORITYR 0x400   //Interrupt Priority
+#define GICD_ITARGETSR  0x800   //Interrupt Targets
+
+// GICC(CPU Interface) register offset
+#define GICC_CTLR       0x0000  //CPU Interface Control
+#define GICC_PMR        0x0004  //Interrupt Priority Mask
+#define GICC_IAR        0x000C  //Interrupt Acknowledge
+#define GICC_EOIR       0x0010  //End of Interrupt
+
+//SYS Interrupt Num
+#define IRQ_TIMER_PHYS_NS   30  //ARM Generic Timer Non-Secure Physical IRQ(PPI 14)
+
+void gic_init(void);
+void gic_enable_interrupt(uint32_t irq_id);
+uint32_t gic_acknowledge_irq(void);
+void gic_end_of_irq(uint32_t irq_id);
+
+
+#endif
+===== ./uart/uart.c =====
+#include "uart.h"
+
+void uart_init(void){
+    *UARTCR = 0x0;
+
+    /*  Baudrate setting base 115200 - 24MHz
+        IBRD = 24000000 / (16 * 115200) = 13.0208 -> 13
+        FBRD = 0.0208 * 64 = 1.33 -> 1 */
+    *UARTIBRD = 13;
+    *UARTFBRD = 1;
+
+    *UARTLCR_H = (1<<4) | (3<<5);
+
+    *UARTCR = (1<<0) | (1<<8) | (1<<9);
+}
+
+void uart_putc(char c){
+    while (*UARTFR & FR_TXFF);
+
+    if(c=='\n'){
+        *UARTDR = '\r';
+        while (*UARTFR & FR_TXFF);
+    }
+    *UARTDR = (uint32_t)c;
+}
+
+void uart_puts(const char *s){
+    while(*s){
+        uart_putc(*s++);
+    }
+}
+
+void uart_put_hex(uint64_t val){
+    const char hex_chars[] = "0123456789ABCDEF";
+    uart_puts("0x");
+    for(int i = 60; i >= 0; i -= 4){
+        uart_putc(hex_chars[(val >> i) & 0xF]);
+    }
+}
+
+
+===== ./uart/uart.h =====
+#ifndef UART_H
+#define UART_H
+
+#include <stdint.h>
+
+#define UART0_BASE 0x09000000
+
+#define UARTDR      ((volatile uint32_t *)(UART0_BASE + 0x00)) //Data Register for rx tx
+#define UARTFR      ((volatile uint32_t *)(UART0_BASE + 0x18)) //Flag Register for state flag
+#define UARTIBRD    ((volatile uint32_t *)(UART0_BASE + 0x24)) //Interger Baud Rate Divisior
+#define UARTFBRD    ((volatile uint32_t *)(UART0_BASE + 0x28)) //Fractional Baud Rate Divisior
+#define UARTLCR_H   ((volatile uint32_t *)(UART0_BASE + 0x2C)) //Line Control Register
+#define UARTCR      ((volatile uint32_t *)(UART0_BASE + 0x30)) //Control Register
+
+#define FR_TXFF (1<<5) //Transmit FIFO Full
+#define FR_RXFE (1<<4) //Receive FIFO Empty
+
+void uart_init(void);
+void uart_putc(char c);
+void uart_puts(const char *s);
+void uart_put_hex(uint64_t val);
+
+#endif
+===== ./mmu/mmu.c =====
+#include "mmu.h"
+#include "pmm.h"
+#include "uart.h"
+
+static uint64_t *l0_root = 0;
+
+
+static void mmu_memzero(void *dst, size_t size){
+    uint8_t*p = (uint8_t *)dst;
+    while (size--)
+    {
+        *p++=0;
+    }
+}
+
+
+uint64_t *mmu_get_root_table(void){
+    return l0_root;
+}
+
+void mmu_tlb_flush(void){
+    asm volatile(
+        "dsb ish\n"
+        "tlbi vmalle1\n"
+        "dsb ish\n"
+        "isb\n"
+        ::: "memory"
+    );
+}
+
+uint64_t mmu_translate(uint64_t *l0_table, uint64_t va){
+    if(!l0_table) return 0;
+
+    uint64_t l0_entry = l0_table[L0_INDEX(va)];
+    if(!(l0_entry & 0x1)) return 0;
+
+    uint64_t *l1_table = (uint64_t *)(l0_entry & 0x0000FFFFFFFFF000ULL);
+    uint64_t l1_entry = l1_table[L1_INDEX(va)];
+    if(!(l1_entry & 0x1)) return 0;    
+
+    uint64_t *l2_table = (uint64_t *)(l1_entry & 0x0000FFFFFFFFF000ULL);
+    uint64_t l2_entry = l2_table[L2_INDEX(va)];
+    if(!(l2_entry & 0x1)) return 0;
+    
+    uint64_t *l3_table = (uint64_t *)(l2_entry & 0x0000FFFFFFFFF000ULL);
+    uint64_t l3_entry = l3_table[L3_INDEX(va)];
+    if(!(l3_entry & 0x1)) return 0;
+
+    return (l3_entry & 0x0000FFFFFFFFF000ULL) | (va & 0xFFFULL);
+}
+
+static uint64_t* get_or_create_table(uint64_t *parent_table, uint64_t index){
+    uint64_t entry = parent_table[index];
+
+    if(entry & 0x1){// If page aleady exists >>  return addr
+        return (uint64_t *)(entry & ~0xFFFULL);
+    }
+
+    void *new_table = pmm_alloc_page();
+    if(!new_table){
+        uart_puts("[MMU ERROR] Out of Memory while allocting page table!\n");
+        return 0;
+    }
+
+    mmu_memzero(new_table, PAGE_SIZE);
+
+    parent_table[index] = ((uint64_t)new_table & ~0xFFFULL) | MMU_DESCRIPTOR_TABLE;
+    return (uint64_t *)new_table;
+}
+
+void mmu_map_page(uint64_t *l0_table, uint64_t va, uint64_t pa, uint64_t flags){
+    uint64_t l0_idx = L0_INDEX(va);
+    uint64_t l1_idx = L1_INDEX(va);
+    uint64_t l2_idx = L2_INDEX(va);
+    uint64_t l3_idx = L3_INDEX(va);
+
+    uint64_t *l1_table = get_or_create_table(l0_table, l0_idx);
+    uint64_t *l2_table = get_or_create_table(l1_table, l1_idx);
+    uint64_t *l3_table = get_or_create_table(l2_table, l2_idx);
+
+    l3_table[l3_idx] = (pa & ~0xFFFULL) | flags;
+}
+
+void mmu_map_range(uint64_t *l0_table, uint64_t va_start, uint64_t pa_start, size_t size, uint64_t flags){
+    uint64_t va = va_start & ~0xFFFULL;
+    uint64_t pa = pa_start & ~0xFFFULL;
+    size_t pages = (size + PAGE_SIZE -1) / PAGE_SIZE;
+
+    for(size_t i = 0; i < pages; i++){
+        mmu_map_page(l0_table, va, pa, flags);
+        va += PAGE_SIZE;
+        pa += PAGE_SIZE;
+    }
+}
+
+void mmu_init(void){
+    l0_root = (uint64_t *)pmm_alloc_page();
+    if(!l0_root){
+        uart_puts("[MMU ERROR] Failed to allocate L0 Root page Table!\n");
+        return;
+    }
+
+    mmu_memzero(l0_root, PAGE_SIZE);
+    
+    //UART MMIO mapping
+    mmu_map_range(l0_root, 0x09000000, 0x09000000, 0x10000, MMU_FLAG_DEVICE);
+    
+    ////GICv2 mapping
+    mmu_map_range(l0_root, 0x08000000, 0x08000000, 0x20000, MMU_FLAG_DEVICE);
+
+    //kernel ram identity mapping 
+    mmu_map_range(l0_root, RAM_START, RAM_START, RAM_SIZE, MMU_FLAG_RAM);
+
+    //set system register and run mmu
+    arm64_mmu_enable((uint64_t)l0_root);
+}
+===== ./mmu/mmu.h =====
+#ifndef MMU_H
+#define MMU_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+#define PAGE_SHIFT      12
+#define PAGE_SIZE       4096
+#define TABLE_ENTRIES   512
+#define VA_MASK_9BIT    0x1FF //0b 0001 1111 1111
+
+//macro to extract page table index from VA
+#define L0_INDEX(va)    (((va) >> 39) & VA_MASK_9BIT)
+#define L1_INDEX(va)    (((va) >> 30) & VA_MASK_9BIT)
+#define L2_INDEX(va)    (((va) >> 21) & VA_MASK_9BIT)
+#define L3_INDEX(va)    (((va) >> 12) & VA_MASK_9BIT)
+
+#define MMU_DESCRIPTOR_TABLE    0x3ULL //table descriptor
+
+#define MMU_DESCRIPTOR_PAGE     0x3ULL //valid 4KB page
+#define MMU_ATTR_DEVICE_INDEX   (0ULL << 2) //Attr 0(Device - nGnRnE)
+#define MMU_ATTR_NORMAL_INDEX   (1ULL << 2) //Attr 1(Normal Cachable)
+#define MMU_ACCESS_FLAG         (1ULL << 10) //bit[10] = 1
+#define MMU_SH_INNER_SHAREABLE  (3ULL << 8) //bit[9:8] = 0b11
+#define MMU_AP_KERNEL_RW        (0ULL << 6) //bit[7:6] = 0b00 (EL1 Read/Write)
+#define MMU_EXECUTE_NEVER       (1ULL << 54)//bit[54] = 1
+
+#define MMU_FLAG_RAM        (MMU_DESCRIPTOR_PAGE | MMU_ATTR_NORMAL_INDEX | \
+                            MMU_ACCESS_FLAG | MMU_SH_INNER_SHAREABLE | MMU_AP_KERNEL_RW)
+
+#define MMU_FLAG_DEVICE     (MMU_DESCRIPTOR_PAGE | MMU_ATTR_DEVICE_INDEX | \
+                            MMU_ACCESS_FLAG | MMU_AP_KERNEL_RW | MMU_EXECUTE_NEVER)
+
+void mmu_init(void);
+void mmu_map_page(uint64_t *l0_table, uint64_t va, uint64_t pa, uint64_t flags);
+void mmu_map_range(uint64_t *l0_table, uint64_t va_start, uint64_t pa_start, size_t size, uint64_t flags);
+
+uint64_t *mmu_get_root_table(void);
+uint64_t mmu_translate(uint64_t *l0_table, uint64_t va);
+void mmu_tlb_flush(void);
+
+
+extern void arm64_mmu_enable(uint64_t l0_table_pa);
+
+#endif
+===== ./mmu/mmu_enable.s =====
+.section ".text"
+.global arm64_mmu_enable
+
+// void arm64_mmu_enable(uint64_t l0_table_pa);
+// x0 is the physical addr of the L0 table
+arm64_mmu_enable:
+    //set MAIR_EL1
+    //Attr 0 (bits[7:0]) = 0x00(device-nGnRnE)
+    //Attr 1 (bits[15:8]) = 0xFF(normal cachable)
+    ldr x1, =0x000000000000FF00
+    msr mair_el1, x1
+
+    //set TCR_EL1
+    // T0SZ = 16 (48-bit Virtual Address, Bits[5:0])
+    // IRGN0 = 0b01 (Inner WB-WA, Bits[9:8])
+    // ORGN0 = 0b01 (Outer WB-WA, Bits[11:10])
+    // SH0 = 0b11 (Inner Shareable, Bits[13:12])
+    // TG0 = 0b00 (4KB Granule, Bits[15:14])
+    // EPD1 = 1 (Disable TTBR1 walks for now, Bit 23)
+    // IPS = 0b010 (40-bit Physical Address space 1TB, Bits[34:32])
+    ldr x2, =   ((16ULL << 0) | (1ULL << 8)  | (1ULL << 10) | (3ULL << 12) | (0ULL << 14) | (1ULL << 23) | (2ULL << 32))
+    msr tcr_el1, x2
+
+    //set L0 root table addr in TTBR0_EL1 
+    msr ttbr0_el1, x0
+
+    //invalid all tlb entries
+    dsb ish
+    tlbi vmalle1
+    dsb ish 
+    isb
+
+    //modify SCTLR_EL1 to enable mmu, data cache, instruction cache
+    mrs x3, sctlr_el1
+    orr x3, x3, #(1 << 0)   //Bit 0 : MMU enable
+    orr x3, x3, #(1 << 2)   //Bit 2 : Data cache enable
+    orr x3, x3, #(1 << 12)  //Bit 12: Instruction cache enable
+    msr sctlr_el1, x3
+    isb
+
+    ret
+    
+
+
+
+===== ./boot/vector.s =====
+.section ".text.vector"
+
+.macro ventry label
+    .align 7 //128bytes
+    b \label
+.endm
+
+.macro kernel_entry
+    sub sp, sp, #272
+    stp x0, x1, [sp, #16 * 0]
+    stp x2, x3, [sp, #16 * 1]
+    stp x4, x5, [sp, #16 * 2]
+    stp x6, x7, [sp, #16 * 3]
+    stp x8, x9, [sp, #16 * 4]
+    stp x10, x11, [sp, #16 * 5]
+    stp x12, x13, [sp, #16 * 6]
+    stp x14, x15, [sp, #16 * 7]
+    stp x16, x17, [sp, #16 * 8]
+    stp x18, x19, [sp, #16 * 9]
+    stp x20, x21, [sp, #16 * 10]
+    stp x22, x23, [sp, #16 * 11]
+    stp x24, x25, [sp, #16 * 12]
+    stp x28, x29, [sp, #16 * 14]
+    stp x26, x27, [sp, #16 * 13]
+
+    mrs x21, spsr_el1
+    mrs x22, elr_el1
+    stp x30, x21, [sp, #16 * 15]
+    str x22, [sp, #16 * 16]
+.endm
+
+.macro kernel_exit
+    ldr x22, [sp, #16 * 16]
+    ldp x30, x21, [sp, #16 * 15]
+    msr elr_el1, x22
+    msr spsr_el1, x21
+    
+    ldp x28, x29, [sp, #16 * 14]
+    ldp x26, x27, [sp, #16 * 13]
+    ldp x24, x25, [sp, #16 * 12]
+    ldp x22, x23, [sp, #16 * 11]
+    ldp x20, x21, [sp, #16 * 10]
+    ldp x18, x19, [sp, #16 * 9]
+    ldp x16, x17, [sp, #16 * 8]
+    ldp x14, x15, [sp, #16 * 7]
+    ldp x12, x13, [sp, #16 * 6]
+    ldp x10, x11, [sp, #16 * 5]
+    ldp x8, x9, [sp, #16 * 4]
+    ldp x6, x7, [sp, #16 * 3]
+    ldp x4, x5, [sp, #16 * 2]
+    ldp x2, x3, [sp, #16 * 1]
+    ldp x0, x1, [sp, #16 * 0]
+    
+    add sp, sp, #272
+    
+    eret
+.endm
+    
+.align 11
+.global exception_vector_table
+exception_vector_table:
+    // 1. current EL with SP0
+    ventry sync_invalid_el1t
+    ventry irq_invalid_el1t
+    ventry fiq_invalid_el1t
+    ventry serror_invalid_el1t
+
+    // 2. current EL with SPx
+    ventry el1_sync_entry // to implement, suffixed with _entry 
+    ventry el1_irq_entry  // to implement, suffixed with _entry
+    ventry fiq_invalid_el1h
+    ventry serror_invalid_el1h
+
+    // 3. current EL with AArch64
+    ventry lower_sync_entry //to implement, suffixed with _entry
+    ventry lower_irq_entry //to implement, suffixed with _entry
+    ventry fiq_invalid_lower
+    ventry serror_invalid_lower
+
+    // 4. current EL with AArch32
+    ventry sync_invalid_aarch32
+    ventry irq_invalid_aarch32
+    ventry fiq_invalid_aarch32
+    ventry serror_invalid_aarch32
+
+el1_sync_entry:
+    kernel_entry
+    mov x0, sp
+    mrs x1, esr_el1
+    mrs x2, far_el1
+    bl  handle_el1_sync
+    kernel_exit
+
+el1_irq_entry:
+    kernel_entry
+    bl  handle_el1_irq
+    kernel_exit
+
+lower_sync_entry:
+    kernel_entry
+    mov x0, sp
+    mrs x1, esr_el1
+    mrs x2, far_el1
+    bl handle_lower_sync
+    kernel_exit
+
+lower_irq_entry:
+    kernel_entry
+    bl handle_lower_irq
+    kernel_exit
+
+sync_invalid_el1t:
+irq_invalid_el1t:
+fiq_invalid_el1t:
+serror_invalid_el1t:
+fiq_invalid_el1h:
+serror_invalid_el1h:
+fiq_invalid_lower:
+serror_invalid_lower:
+sync_invalid_aarch32:
+irq_invalid_aarch32:
+fiq_invalid_aarch32:
+serror_invalid_aarch32:
+    kernel_entry
+    mov x0, sp
+    mrs x1, esr_el1
+    mrs x2, far_el1
+    bl handle_unknown_exception
+1:  wfe
+    b 1b
+
+
+
+
+===== ./boot/boot.s =====
+.section ".text.boot"
+.global _start
+
+_start:
+	mrs x0, mpidr_el1
+	and x0, x0, #0xFF
+	cbz x0, el_setup
+
+hang:
+	wfe
+	b hang
+
+el_setup:
+	mrs x0, CurrentEL
+	lsr x0, x0, #2
+
+	cmp x0, #3
+	b.eq level_el3
+	cmp x0, #2
+	b.eq level_el2
+	b init_kernel_sp
+	
+level_el3:
+	ldr x1, =0x401
+	msr scr_el3, x1
+
+	mov x1, #0b00101
+	msr spsr_el3, x1
+	
+	adr x1, init_kernel_sp
+	msr elr_el3, x1
+	
+	eret
+
+level_el2:
+	ldr x1, =0x80000000
+	msr hcr_el2, x1
+
+	mov x1, #0b00101
+	msr spsr_el2, x1
+	
+	adr x1, init_kernel_sp
+	msr elr_el2, x1
+	
+	eret
+
+init_kernel_sp:
+	mov x0, #(3<<20) // fcu/neon disable		
+	msr cpacr_el1, x0
+	isb
+
+	ldr x0, = __stack_top
+	mov sp, x0
+
+	ldr x1, = __bss_start
+	ldr x2, = __bss_end
+
+clear_bss:
+	cmp x1, x2
+	b.ge enter_kernel
+	str xzr, [x1], #8
+	b clear_bss
+
+enter_kernel:
+	bl kernel_main
+system_halt:
+	wfi
+	b system_halt
+	
+===== ./timer/timer.c =====
+#include "timer.h"
+#include "gic.h"
+#include "uart.h"
+
+static volatile uint64_t timer_ticks = 0;
+static uint64_t timer_interval = 0;
+
+static inline uint64_t read_cntfrq(void){
+    uint64_t val;
+    asm volatile("mrs %0, cntfrq_el0" : "=r"(val));
+    return val;
+}
+static inline void write_cntpfrq(uint64_t val){
+    asm volatile("msr cntfrq_el0, %0" : : "r"(val));
+}
+
+static inline void write_cntp_tval(uint64_t val){
+    asm volatile("msr cntp_tval_el0, %0" : : "r"(val) : "memory");
+}
+
+static inline uint64_t read_cntp_tval(void){
+    uint64_t val;
+    asm volatile("mrs %0, cntp_tval_el0" : "=r"(val));
+    return val;
+}
+
+static inline void write_cntp_ctl(uint64_t val){
+    asm volatile("msr cntp_ctl_el0, %0" : : "r"(val) : "memory");
+}
+
+static inline uint64_t read_cntp_ctl(void){
+    uint64_t val;
+    asm volatile("mrs %0, cntp_ctl_el0" : "=r"(val));
+    return val;
+}
+
+void timer_init(uint32_t target_hz){
+    if(target_hz == 0) target_hz = 100; //default = 100Hz(10ms)
+    
+    //Read the CPU physical timer frequency
+    uint64_t freq = read_cntfrq(); 
+
+    if (freq == 0){
+        freq = 62500000ULL;
+        write_cntpfrq(freq);
+    }
+    //Calculate the countdown value for a single interrupt
+    timer_interval = freq / target_hz;
+
+    //In GICv2 enable Num 30 Timer Interrupt
+    gic_enable_interrupt(IRQ_TIMER_PHYS_NS);
+
+    write_cntp_tval(timer_interval);
+    write_cntp_ctl(1);
+}
+
+void timer_handle_irq(void){
+    //if you wanna test it, uncomment the uart code below
+    //uart_puts("[TIMER IRQ] ENTER\n");
+    //uart_puts("[TIMER IRQ] ticks = ");
+    //uart_put_hex(timer_ticks);
+    //uart_puts("\n");
+
+    timer_ticks++;
+    //Reload the countdown timer for the next period
+    write_cntp_tval(timer_interval);
+}
+
+uint64_t timer_get_ticks(void){
+    return timer_ticks;
+}
+
+void timer_sleep_ticks(uint64_t count){
+    uint64_t start = timer_ticks;
+    while(timer_ticks - start < count){
+        asm volatile ("wfi"); // Wait for an interrupt 
+    }
+}
+
+
+
+
+
+===== ./timer/timer.h =====
+#ifndef TIMER_H
+#define TIMER_H
+
+#include <stdint.h>
+
+void timer_init(uint32_t target_hz);
+void timer_handle_irq(void);
+uint64_t timer_get_ticks(void);
+void timer_sleep_ticks(uint64_t count);
+
+
+
+#endif
+===== ./Makefile =====
+CROSS_COMPILE ?= aarch64-linux-gnu-
+CC		:= $(CROSS_COMPILE)gcc
+AS		:= $(CROSS_COMPILE)gcc
+LD		:= $(CROSS_COMPILE)ld
+
+QEMU	:= qemu-system-aarch64
+QFLAGS	:= -M virt,gic-version=2 -cpu cortex-a53 -nographic -serial mon:stdio
+
+CFLAGS	:= -Wall -Wextra -O2 -ffreestanding -nostdlib -nostartfiles -mgeneral-regs-only \
+			-Iuart -Ikernel -Itest -Ipmm -Iheap -Immu -Igic -Itimer
+ASFLAGS	:= -Wall -ffreestanding -nostdlib
+LDFLAGS	:= -T linker.ld -nostdlib --no-warn-rwx-segments
+
+ifeq ($(TEST), 1)
+	CFLAGS += -DENABLE_TESTS
+endif
+
+
+BUILD_DIR	:= build
+TARGET_ELF	:= $(BUILD_DIR)/kernel.elf
+
+SRCS_C	:= kernel/kernel.c kernel/exception.c uart/uart.c pmm/pmm.c heap/heap.c mmu/mmu.c gic/gic.c timer/timer.c\
+			test/test_exception.c test/test_pmm.c test/test_heap.c test/test_mmu.c test/test_timer.c
+SRCS_S	:= boot/boot.s boot/vector.s mmu/mmu_enable.s
+
+OBJS	:= 	$(patsubst %.c, $(BUILD_DIR)/%.o, $(SRCS_C)) \
+			$(patsubst %.s, $(BUILD_DIR)/%.o, $(SRCS_S))
+
+.PHONY: all run debug test clean
+
+all: $(TARGET_ELF)
+
+$(TARGET_ELF): $(OBJS) linker.ld
+		@mkdir -p $(dir $@)
+		$(LD) $(LDFLAGS) -o $@ $(OBJS)
+
+$(BUILD_DIR)/%.o: %.c
+		@mkdir -p $(dir $@)
+		$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/%.o: %.s
+		@mkdir -p $(dir $@)
+		$(AS) $(ASFLAGS) -c $< -o $@
+
+run: $(TARGET_ELF)
+		$(QEMU) $(QFLAGS) -kernel $(TARGET_ELF)
+
+debug: $(TARGET_ELF)
+		$(QEMU) $(QFLAGS) -kernel $(TARGET_ELF) -s -S
+
+test: 
+		@$(MAKE) clean
+		@$(MAKE) run TEST=1
+
+clean:
+		rm -rf $(BUILD_DIR)
+
+===== ./linker.ld =====
+ENTRY(_start)
+
+SECTIONS
+{
+    . = 0x40000000;
+
+
+    .text.boot :
+    {
+        *(.text.boot)
+    }
+    .text.vector : ALIGN(2048)
+    {
+        *(.text.vector)
+    }
+    .text : ALIGN(4K)
+    {
+        *(.text)
+    }
+
+
+    .rodata : ALIGN(4K)
+    {
+        *(.rodata*)
+    }
+
+    .data : ALIGN(4K)
+    {
+        *(.data*)
+    }
+
+    .bss : ALIGN(16)
+    {
+        __bss_start = .;
+        *(.bss*)
+        *(COMMON)
+        . = ALIGN(16);
+        __bss_end = .;
+    }
+
+    .stack : ALIGN(16)
+    {
+        __stack_bottom = .;
+        . = . + 0x10000;
+        __stack_top = .;
+    }
+    
+    . = ALIGN(4K);
+    __kernel_end = .;
+
+}

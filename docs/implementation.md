@@ -3,7 +3,7 @@
                                                               │
                                                               ▼
 [Phase 6: User Mode]  ◄── [Phase 5: Scheduling] ◄── [Phase 4: Interrupt]
-(EL0 / SVC 시스템콜)       (PCB / 선점형 스케줄러)     (GIC / ARM Generic Timer)
+(EL0 / SVC 시스템콜)       (PCB / 선점형 스케줄러)     (GIC / ARM Generic Timer) [완료]
         │
         ▼
 [Phase 7: Storage & VFS] ──► [Phase 8: Shell & Apps]
