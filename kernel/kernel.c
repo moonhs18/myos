@@ -5,6 +5,7 @@
 #include "mmu.h"
 #include "gic.h"
 #include "timer.h"
+#include "sched.h"
 
 #ifdef ENABLE_TESTS
 #include "test.h"
@@ -45,11 +46,15 @@ void kernel_main(void) {
     timer_init(100);
     uart_puts("[OK] ARM Generic Timer Initialized.\n");
     
+    sched_init();
+    uart_puts("[OK] Preemptive Scheduler Initialized.\n");
+
     enable_irq();
     uart_puts("[OK] CPU Global Interrupts Unmasked.\n");
 
 #ifdef ENABLE_TESTS
     test_timer_ticks();
+    test_scheduler_preemption();
 #endif
     uart_puts(">> Kernel is now in idle state.\n");
 

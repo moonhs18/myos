@@ -6,5 +6,6 @@ void test_pmm_allocator(void);
 void test_heap_allocator(void);
 void test_mmu_virtual_memory(void);
 void test_timer_ticks(void);
+void test_scheduler_preemption(void);
 
 #endif

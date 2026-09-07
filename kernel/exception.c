@@ -2,6 +2,7 @@
 #include <uart.h>
 #include <gic.h>
 #include <timer.h>
+#include <sched.h>
 
 extern char exception_vector_table[];
 
@@ -77,6 +78,10 @@ void handle_el1_irq(void){
     }
     if(irq_id == IRQ_TIMER_PHYS_NS){
         timer_handle_irq();
+
+        gic_end_of_irq(irq_id);
+
+        sched_tick();
     }
 
     gic_end_of_irq(irq_id);
