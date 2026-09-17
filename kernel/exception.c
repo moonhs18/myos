@@ -3,6 +3,7 @@
 #include <gic.h>
 #include <timer.h>
 #include <sched.h>
+#include <syscall.h>
 
 extern char exception_vector_table[];
 
@@ -82,6 +83,7 @@ void handle_el1_irq(void){
         gic_end_of_irq(irq_id);
 
         sched_tick();
+        return;
     }
 
     gic_end_of_irq(irq_id);
@@ -89,17 +91,34 @@ void handle_el1_irq(void){
 
 void handle_lower_sync(trap_frame_t *tf, uint64_t esr, uint64_t far){
     uint64_t ec = (esr >> 26) & 0x3F;
+
     if(ec == 0x15){
+        syscall_dispatch(tf);
         uart_puts("[SYSCALL] System Call Invoked from User Mode!\n");
         return;
     }
+
     print_panic_dump(tf, esr, far, "User Space (EL0) Exception\n");
-    while(1);
+    uart_puts("[KERNEL] Terminating Malicious/Faulty User Task...\n");
+    task_exit();
 }
 
 void handle_lower_irq(void){
-    uart_puts("[IRQ] User Space Interrupt Triggered!\n");
-    handle_el1_irq();
+    uint32_t irq_id = gic_acknowledge_irq();
+
+    if(irq_id >= 1020){
+        return;
+    }
+    if(irq_id == IRQ_TIMER_PHYS_NS){
+        timer_handle_irq();
+
+        gic_end_of_irq(irq_id);
+
+        sched_tick();
+        return;
+    }
+
+    gic_end_of_irq(irq_id);
 }
 
 void handle_unknown_exception(trap_frame_t *tf, uint64_t esr, uint64_t far){

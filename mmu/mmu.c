@@ -53,7 +53,7 @@ static uint64_t* get_or_create_table(uint64_t *parent_table, uint64_t index){
     uint64_t entry = parent_table[index];
 
     if(entry & 0x1){// If page aleady exists >>  return addr
-        return (uint64_t *)(entry & ~0xFFFULL);
+        return (uint64_t *)(entry & 0x0000FFFFFFFFF000ULL);
     }
 
     void *new_table = pmm_alloc_page();
@@ -64,7 +64,7 @@ static uint64_t* get_or_create_table(uint64_t *parent_table, uint64_t index){
 
     mmu_memzero(new_table, PAGE_SIZE);
 
-    parent_table[index] = ((uint64_t)new_table & ~0xFFFULL) | MMU_DESCRIPTOR_TABLE;
+    parent_table[index] = ((uint64_t)new_table & 0x0000FFFFFFFFF000ULL) | MMU_DESCRIPTOR_TABLE;
     return (uint64_t *)new_table;
 }
 
@@ -78,10 +78,10 @@ void mmu_map_page(uint64_t *l0_table, uint64_t va, uint64_t pa, uint64_t flags){
     uint64_t *l2_table = get_or_create_table(l1_table, l1_idx);
     uint64_t *l3_table = get_or_create_table(l2_table, l2_idx);
 
-    l3_table[l3_idx] = (pa & ~0xFFFULL) | flags;
+    l3_table[l3_idx] = (pa & 0x0000FFFFFFFFF000ULL) | flags;
 }
 
-void mmu_map_range(uint64_t *l0_table, uint64_t va_start, uint64_t pa_start, size_t size, uint64_t flags){
+void mmu_map_range(uint64_t *l0_table, uint64_t va_start, uint64_t pa_start, size_t size, uint64_t flags){    
     uint64_t va = va_start & ~0xFFFULL;
     uint64_t pa = pa_start & ~0xFFFULL;
     size_t pages = (size + PAGE_SIZE -1) / PAGE_SIZE;
@@ -95,6 +95,7 @@ void mmu_map_range(uint64_t *l0_table, uint64_t va_start, uint64_t pa_start, siz
 
 void mmu_init(void){
     l0_root = (uint64_t *)pmm_alloc_page();
+    
     if(!l0_root){
         uart_puts("[MMU ERROR] Failed to allocate L0 Root page Table!\n");
         return;
@@ -108,9 +109,53 @@ void mmu_init(void){
     ////GICv2 mapping
     mmu_map_range(l0_root, 0x08000000, 0x08000000, 0x20000, MMU_FLAG_DEVICE);
 
-    //kernel ram identity mapping 
+    //kernel ram EL1 only 
     mmu_map_range(l0_root, RAM_START, RAM_START, RAM_SIZE, MMU_FLAG_RAM);
 
+    //user image
+    extern char __user_text_start[];
+    extern char __user_text_end[];
+    
+    extern char __user_rodata_start[];
+    extern char __user_rodata_end[];
+    
+    extern char __user_data_start[];
+    extern char __user_data_end[];
+    
+    uint64_t user_text_start = (uint64_t)__user_text_start;
+    uint64_t user_text_size = (uint64_t)__user_text_end - user_text_start;
+
+    if(user_text_size){
+        //user code
+        mmu_map_range(l0_root, user_text_start, user_text_start,user_text_size, MMU_FLAG_USER_CODE);   
+    }
+
+    
+
+
+    uint64_t user_rodata_start = (uint64_t)__user_rodata_start;
+    uint64_t user_rodata_size = (uint64_t)__user_rodata_end - user_rodata_start;    
+
+   if(user_rodata_size){
+        //user RO data
+        mmu_map_range(l0_root,user_rodata_start, user_rodata_start, user_rodata_size, MMU_FLAG_USER_RODATA);
+    }
+
+    uint64_t user_data_start = (uint64_t)__user_data_start;
+    uint64_t user_data_size = (uint64_t)__user_data_end - user_data_start;    
+
+   if(user_data_size){
+        //user RO data
+        mmu_map_range(l0_root,user_data_start, user_data_start, user_data_size, MMU_FLAG_USER_DATA);
+    }
+
+
+
+
+    uart_puts("[MMU] Before enable\n");
     //set system register and run mmu
     arm64_mmu_enable((uint64_t)l0_root);
+
+    uart_puts("[MMU] After enable\n");
+    
 }

@@ -18,23 +18,28 @@ arm64_mmu_enable:
     // TG0 = 0b00 (4KB Granule, Bits[15:14])
     // EPD1 = 1 (Disable TTBR1 walks for now, Bit 23)
     // IPS = 0b010 (40-bit Physical Address space 1TB, Bits[34:32])
-    ldr x2, =   ((16ULL << 0) | (1ULL << 8)  | (1ULL << 10) | (3ULL << 12) | (0ULL << 14) | (1ULL << 23) | (2ULL << 32))
+    //ldr x2, =   ((16ULL << 0) | (1ULL << 8)  | (1ULL << 10) | (3ULL << 12) | (0ULL << 14) | (1ULL << 23) | (2ULL << 32))
+    ldr x2, =0x0000000280153510
     msr tcr_el1, x2
+    isb
+
 
     //set L0 root table addr in TTBR0_EL1 
     msr ttbr0_el1, x0
+    isb
 
     //invalid all tlb entries
     dsb ish
     tlbi vmalle1
-    dsb ish 
+    dsb ish
     isb
 
     //modify SCTLR_EL1 to enable mmu, data cache, instruction cache
     mrs x3, sctlr_el1
     orr x3, x3, #(1 << 0)   //Bit 0 : MMU enable
-    orr x3, x3, #(1 << 2)   //Bit 2 : Data cache enable
-    orr x3, x3, #(1 << 12)  //Bit 12: Instruction cache enable
+    bic x3, x3, #(1 << 2)   //Bit 2 : Data cache enable
+    bic x3, x3, #(1 << 12)  //Bit 12: Instruction cache enable
+    bic x3, x3, #(1 << 19) //Disable WXN
     msr sctlr_el1, x3
     isb
 

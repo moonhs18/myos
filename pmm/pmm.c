@@ -1,9 +1,13 @@
 #include "pmm.h"
 #include "uart.h"
 #include <stddef.h>
+#include "memory_layout.h"
 
 
 extern char __kernel_end[];
+
+extern char __user_image_start[];
+extern char __user_image_end[];
 
 static uint64_t *bitmap = 0;
 static uint64_t total_pages = 0;
@@ -33,8 +37,9 @@ static void pmm_memzero(void *dst, size_t size){
 
 void pmm_init(void){
     total_pages = (RAM_END - RAM_START) / PAGE_SIZE;
+
     bitmap_total_words = (total_pages + 63) / 64;
-    uint64_t bitmap_size_bytes = bitmap_total_words * 8;
+    uint64_t bitmap_size_bytes = bitmap_total_words * sizeof(uint64_t);
 
     //locate bitmap -> kernel_end
     bitmap = (uint64_t *)(((uint64_t)__kernel_end + 7) & ~7ULL);
@@ -48,9 +53,28 @@ void pmm_init(void){
     usable_start_addr = (free_start + PAGE_SIZE -1) & ~(PAGE_SIZE - 1);
 
     uint64_t start_page_idx = (usable_start_addr - RAM_START) / PAGE_SIZE; //to get page num
+   
     for(uint64_t i = start_page_idx; i<total_pages; i++){
         bitmap_clear(i);
     }
+    //user image pmm reserved
+    uint64_t user_start = ((uint64_t)__user_image_start & ~(PAGE_SIZE -1));
+    uint64_t user_end = ((uint64_t)__user_image_end + PAGE_SIZE -1) & ~(PAGE_SIZE -1);
+
+    if(user_start < RAM_END && user_end > RAM_START){
+        if(user_start < RAM_START)
+            user_start = RAM_START;
+        if(user_end > RAM_END)
+            user_end =RAM_END;
+
+        uint64_t first_page = (user_start - RAM_START) / PAGE_SIZE;
+        uint64_t last_page = (user_end - RAM_START) / PAGE_SIZE;
+        
+        for(uint64_t i =first_page; i <last_page; i++){
+            bitmap_set(i);
+        }
+    }
+    uart_puts("[PMM] User image pages reserved.\n");
 }
 
 void *pmm_alloc_pages(uint64_t count){

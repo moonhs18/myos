@@ -12,7 +12,7 @@ static void task_worker_a(void) {
         uart_put_hex(timer_get_ticks());
         uart_puts("\n");
         task_a_counter++;
-        timer_sleep_ticks(10); // 100ms 대기 (타이머 인터럽트에 의한 선점 유도)
+        timer_sleep_ticks(10);
     }
     uart_puts("  [Task A] Work Finished -> Exiting.\n");
 }
@@ -38,7 +38,6 @@ void test_scheduler_preemption(void) {
 
     uart_puts("[TEST] Tasks Created. Waiting for Preemptive Context Switches...\n");
 
-    // 두 태스크가 모두 3회 이상 실행을 마치고 종료될 때까지 대기
     while (task_a_counter < 3 || task_b_counter < 3) {
         asm volatile("wfi");
     }

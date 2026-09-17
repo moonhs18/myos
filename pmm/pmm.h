@@ -4,11 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define PAGE_SIZE   4096
-#define RAM_START   0x40000000
-#define RAM_SIZE    0x08000000
-#define RAM_END     (RAM_START + RAM_SIZE)
-
+#include "memory_layout.h"
 
 void pmm_init(void);
 void *pmm_alloc_page(void);
