@@ -48,7 +48,7 @@ typedef struct vnode{
 
 //Open File Handle structure
 typedef struct file{
-    vnode *vnode;
+    vnode_t *vnode;
     uint64_t pos;   //current file r/w offset
     int flags;      //open mode flag
     int ref_count;  //reference count
