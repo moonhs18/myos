@@ -3,12 +3,13 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "vfs.h"
 
 #include "memory_layout.h"
 
 #define TASK_STACK_SIZE         4096//Each Task size
 #define DEFAULT_TIME_SLICE      5   //Default 50ms
-
+#define MAX_FD 16
 
 //ARM64 Callee Saved Register
 typedef struct cpu_context
@@ -50,6 +51,8 @@ typedef struct task_struct
 
     void *stack_base;           //stack start physical addr
     void *user_stack_base;      //user stack (EL0)
+
+    file_t *fd_table[MAX_FD];
     
     uint64_t user_stack_top;    //user stack VA
     
