@@ -6,7 +6,7 @@ LD		:= $(CROSS_COMPILE)ld
 QEMU	:= qemu-system-aarch64
 QFLAGS	:= -M virt,gic-version=2 -cpu cortex-a53 -nographic -serial mon:stdio
 
-CFLAGS	:= -g -Wall -Wextra -O2 -ffreestanding -nostdlib -nostartfiles -mgeneral-regs-only \
+CFLAGS	:= -g -Wall -Wextra -O3 -ffreestanding -nostdlib -nostartfiles -mgeneral-regs-only \
 			-Iuart -Ikernel -Itest -Ipmm -Iheap -Immu -Igic -Itimer -Isched -Isyscall
 ASFLAGS	:= -Wall -ffreestanding -nostdlib
 LDFLAGS	:= -T linker.ld -nostdlib --no-warn-rwx-segments

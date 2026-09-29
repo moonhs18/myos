@@ -2,6 +2,7 @@
 #include "sched.h"
 #include "uart.h"
 #include "task.h"
+#include "vfs.h"
 
 static int user_range_valid(uint64_t ptr, uint64_t size){
     if(size == 0)
@@ -88,6 +89,8 @@ void syscall_init(void){
 void syscall_dispatch(trap_frame_t *tf){
     uint64_t syscall_num = tf->x[8]; //AArch64 ABI
 
+    task_struct_t *current = sched_get_current_task();
+
     if(syscall_num >= MAX_SYSCALL || !syscall_table[syscall_num]){
         uart_puts("[SYSCALL ERROR] Unknown Syscall Invoked: ");
         uart_put_hex(syscall_num);
@@ -102,28 +105,100 @@ void syscall_dispatch(trap_frame_t *tf){
     uint64_t arg1 = tf->x[1];
     uint64_t arg2 = tf->x[2];
     
-    switch (syscall_num){
+    switch (syscall_num) {
         case SYS_YIELD:
-            tf -> x[0] = ((int64_t (*)(void))syscall_table[SYS_YIELD])();
-            return;
-        case SYS_WRITE:
-            tf -> x[0] = ((int64_t (*)(int, const char *, size_t))syscall_table[SYS_WRITE])((int)arg0, (const char *)arg1, (size_t)arg2);
-            return;
-        case SYS_GETPID:
-            tf -> x[0] = ((int64_t (*)(void))syscall_table[SYS_GETPID])();
-            return;
-        case SYS_SLEEP:
-            tf -> x[0] = ((int64_t (*)(uint64_t))syscall_table[SYS_SLEEP])(arg0);
-            return;
-        case SYS_EXIT:
-            ((int64_t (*)(int))syscall_table[SYS_EXIT])((int)arg0);
-            while (1)
-            {
-                asm volatile("wfe");
+            sched_yield();
+            tf->x[0] = 0;
+            break;
+
+        case SYS_WRITE: {
+            int fd = (int)tf->x[0];
+            const char *buf = (const char *)tf->x[1];
+            size_t count = (size_t)tf->x[2];
+
+            // Standard Output (1) / Standard Error (2) -> Console UART 직접 출력 지원
+            if (fd == 1 || fd == 2) {
+                for (size_t i = 0; i < count; i++) uart_putc(buf[i]);
+                tf->x[0] = count;
+            } else if (fd >= 0 && fd < MAX_FD && current->fd_table[fd]) {
+                tf->x[0] = vfs_write(current->fd_table[fd], buf, count);
+            } else {
+                tf->x[0] = -1; // Invalid FD
             }
+            break;
+        }
+
+        case SYS_READ: {
+            int fd = (int)tf->x[0];
+            void *buf = (void *)tf->x[1];
+            size_t count = (size_t)tf->x[2];
+
+            if (fd >= 0 && fd < MAX_FD && current->fd_table[fd]) {
+                tf->x[0] = vfs_read(current->fd_table[fd], buf, count);
+            } else {
+                tf->x[0] = -1;
+            }
+            break;
+        }
+
+        case SYS_OPEN: {
+            const char *path = (const char *)tf->x[0];
+            int flags = (int)tf->x[1];
+
+            int free_fd = -1;
+            for (int i = 3; i < MAX_FD; i++) { // 0, 1, 2 표준 입출력 제외 빈 슬롯 검색
+                if (current->fd_table[i] == NULL) {
+                    free_fd = i;
+                    break;
+                }
+            }
+
+            if (free_fd < 0) {
+                tf->x[0] = -1; // Table Full
+                break;
+            }
+
+            file_t *file = vfs_open(path, flags);
+            if (file) {
+                current->fd_table[free_fd] = file;
+                tf->x[0] = free_fd;
+            } else {
+                tf->x[0] = -1;
+            }
+            break;
+        }
+
+        case SYS_CLOSE: {
+            int fd = (int)tf->x[0];
+            if (fd >= 0 && fd < MAX_FD && current->fd_table[fd]) {
+                vfs_close(current->fd_table[fd]);
+                current->fd_table[fd] = NULL;
+                tf->x[0] = 0;
+            } else {
+                tf->x[0] = -1;
+            }
+            break;
+        }
+
+        case SYS_GETPID:
+            tf->x[0] = current->pid;
+            break;
+
+        case SYS_SLEEP:
+            sched_sleep((uint64_t)tf->x[0]);
+            tf->x[0] = 0;
+            break;
+
+        case SYS_EXIT:
+            sched_exit_task((int)tf->x[0]);
+            break;
+
         default:
-            tf -> x[0] = (uint64_t)-1;
-            return;
+            uart_puts("[SYSCALL] Unknown Syscall Number: ");
+            uart_put_hex(syscall_num);
+            uart_puts("\n");
+            tf->x[0] = -1;
+            break;
     }
 }
 
