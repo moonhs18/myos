@@ -75,7 +75,7 @@ static inline void sys_read(int fd, void *buf, size_t count){
 }
 
 static inline void sys_close(int fd){
-    register uint64_t x8 asm("x8") = SYS_EXIT;
+    register uint64_t x8 asm("x8") = SYS_CLOSE;
     register int64_t  x0 asm("x0") = (uint64_t)fd;
 
     asm volatile("svc #0" : "+r"(x0) : "r"(x8) : "memory");
