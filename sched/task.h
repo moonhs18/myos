@@ -3,9 +3,9 @@
 
 #include <stdint.h>
 #include <stddef.h>
-#include "vfs.h"
 
 #include "memory_layout.h"
+#include "vfs.h"
 
 #define TASK_STACK_SIZE         4096//Each Task size
 #define DEFAULT_TIME_SLICE      5   //Default 50ms

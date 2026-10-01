@@ -2635,3 +2635,7202 @@ SECTIONS
 }-e 
 
 
+
+
+=== ./vfs/vfs.h ===
+#ifndef VFS_H
+#define VFS_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+#define MAX_PATH_LEN    128
+#define MAX_FILENAME    32
+#define MAX_OPEN_FILES  32
+
+//File Access FLAG
+#define O_RDONLY        0x000
+#define O_WRONLY        0x001
+#define O_RDWR          0x002
+#define O_CREAT         0x040
+#define O_TRUNC         0x200
+
+//vnode type 
+typedef enum {
+    VNODE_TYPE_FILE,
+    VNODE_TYPE_DIR,
+    VNODE_TYPE_DEV
+} vnode_type_t;
+
+struct vnode;
+
+//VFS polymorphic interface via function pointer table
+typedef struct vnode_ops{
+    int (*open)(struct vnode *node, int flags);
+    int64_t (*read)(struct vnode *node, uint64_t offset, void *buf, size_t count);
+    int64_t (*write)(struct vnode *node, uint64_t offset, void *buf, size_t count);
+    int (*close)(struct vnode *node);
+    struct vnode* (*lookup)(struct vnode *parent, const char *name);
+    int (*create)(struct vnode *parent, const char *name, vnode_type_t type, struct vnode **out_node);
+} vnode_ops_t;
+
+//Virtual File System Node(vnode)
+typedef struct vnode{
+    char name[MAX_FILENAME];
+    vnode_type_t type;
+    size_t size;
+    void *interanl_data;
+    vnode_ops_t *ops;
+    struct vnode *parent;
+    struct vnode *child_head;
+    struct vnode *next_sibling;
+} vnode_t;
+
+//Open File Handle structure
+typedef struct file{
+    vnode_t *vnode;
+    uint64_t pos;   //current file r/w offset
+    int flags;      //open mode flag
+    int ref_count;  //reference count
+} file_t;
+
+//VFS open API
+void vfs_init(void);
+vnode_t* vfs_get_root(void);
+vnode_t* vfs_lookup(const char *path);
+file_t* vfs_open(const char *path, int flags);
+int64_t vfs_read(file_t *file, void *buf, size_t count);
+int64_t vfs_write(file_t *file, const void *buf, size_t count);
+int vfs_close(file_t *file);
+
+#endif-e 
+
+
+=== ./vfs/vfs.c ===
+#include "vfs.h"
+#include "heap.h"
+#include "uart.h"
+
+static vnode_t *root_vnode = NULL;
+
+//String utility 
+static int vfs_strcmp(const char *s1, const char *s2){
+    while(*s1 && (*s1 == *s2)) {s1++, s2++;}
+    return *(const unsigned char*)s1 - *(const unsigned char*)s2;
+}
+
+
+static void vfs_strncpy(char *dest, const char *src, size_t n){
+    size_t i;
+    for(i = 0; i < n-1 && src[i] != '\0'; i++){
+        dest[i] = src[i];
+    }
+    dest[i] = '\0';
+}
+
+vnode_t* vfs_create_vnode(const char *name, vnode_type_t type, vnode_ops_t *ops){
+    vnode_t *node = (vnode_t *)kmalloc(sizeof(vnode_t));
+    if(!node) return NULL;
+
+    vfs_strncpy(node->name, name, MAX_FILENAME);
+    node->type = type;
+    node->size = 0;
+    node->interanl_data = NULL;
+    node->ops = ops;
+    node->parent = NULL;
+    node->child_head = NULL;
+    node->next_sibling = NULL;
+
+    return node;
+}
+
+void vfs_add_child(vnode_t *parent, vnode_t *child){
+    if(!parent || !child) return;
+    child->parent = parent;
+    child->next_sibling = parent->child_head;
+    parent->child_head = child;
+}
+
+
+//path parsing and hierarchical vnode lookup engine
+vnode_t* vfs_lookup(const char *path){
+    if(!path || path[0] != '/') return NULL;
+    if(path[1] == '\0') return root_vnode;
+
+    vnode_t *curr = root_vnode;
+    char token[MAX_FILENAME];
+    const char *p = path + 1;
+
+    while (*p)
+    {
+        size_t len = 0;
+        while (*p && *p != '/'){
+            if(len <MAX_FILENAME - 1){
+                token[len++] = *p;
+            }
+            p++;
+        }
+        token[len] = '\0';
+        if(*p == '/') p++;
+
+        if(len == 0) continue;
+
+        //Lookup a child node from the curr dir node
+        if(curr->type != VNODE_TYPE_DIR) return NULL;
+        
+        vnode_t *child = curr->child_head;
+        vnode_t *found = NULL;
+        
+        while (child)
+        {
+            if(vfs_strcmp(child->name, token) == 0){
+                found = child;
+                break;
+            }
+            child = child->next_sibling;
+        }
+        
+        if(!found){
+            if(curr->ops && curr->ops->lookup){
+                found = curr->ops->lookup(curr, token);
+            }
+        }
+
+        if(!found) return NULL;
+        curr = found;
+    }
+    
+    return curr;
+}
+
+file_t* vfs_open(const char *path, int flags){
+    vnode_t *node = vfs_lookup(path);
+    
+    if(!node && (flags & O_CREAT)){
+        char parent_path[MAX_PATH_LEN];
+        char filename[MAX_FILENAME];
+
+        vfs_strncpy(parent_path, path, MAX_PATH_LEN);
+        int last_slash = -1;
+        for(int i=0; parent_path[i] != '\0';i++){
+            if(parent_path[i] = '/') last_slash = i;
+        }
+
+        if(last_slash == 0){
+            vfs_strncpy(parent_path, '/', MAX_PATH_LEN);
+            vfs_strncpy(filename, path + 1, MAX_FILENAME);
+        }
+        else if (last_slash > 0)
+        {
+            parent_path[last_slash] = '\0';
+            vfs_strncpy(filename, path + last_slash + 1, MAX_FILENAME);
+        }
+        else{
+            return NULL;
+        }
+
+        vnode_t *parent = vfs_lookup(parent_path);
+        if(parent && parent->ops && parent->ops->create){
+            parent->ops->create(parent, filename, VNODE_TYPE_FILE, &node);
+        }            
+    }
+    if(!node) return NULL;
+
+    if(node->ops && node->ops->open){
+        if(node->ops->open(node, flags) < 0) return NULL;
+    }
+
+    file_t *file = (file_t *)kmalloc(sizeof(file_t));
+    if(!file) return NULL;
+
+    file->vnode = node;
+    file->pos = 0;
+    file->flags = flags;
+    file->ref_count = 1;
+
+    return file;
+}
+
+int64_t vfs_read(file_t *file, void *buf, size_t count){
+    if(!file || !file->vnode || !file->vnode->ops || !file->vnode->ops->read) return -1;
+
+    int64_t bytes_read = file->vnode->ops->read(file->vnode, file->pos, buf, count);
+    if(bytes_read > 0){
+        file->pos +=bytes_read;
+    }
+    return bytes_read;
+}
+
+int64_t vfs_write(file_t *file, const void *buf, size_t count){
+    if(!file || !file->vnode || !file->vnode->ops || !file->vnode->ops->read) return -1;
+
+    int64_t bytes_written = file->vnode->ops->write(file->vnode, file->pos, buf, count);
+    if(bytes_written > 0){
+        file->pos += bytes_written;
+    }
+    return bytes_written;
+}
+
+int vfs_close(file_t *file){
+    if(!file) return -1;
+
+    file->ref_count--;
+    if(file->ref_count <= 0){
+        if(file->vnode && file->vnode->ops && file->vnode->ops->close){
+            file->vnode->ops->close(file->vnode);
+        }
+        kfree(file);
+    }
+    return 0;
+}
+
+vnode_t* vfs_get_root(void){
+    return root_vnode;
+}
+
+void vfs_inint(void){
+
+    root_vnode = vfs_create_vnode("", VNODE_TYPE_DIR, NULL);
+    uart_puts("[VFS] Virtual File System Infrastructured Initialized.\n");
+}-e 
+
+
+=== ./vfs/ramfs.c ===
+#include "ramfs.h"
+#include "heap.h"
+#include "uart.h"
+
+typedef struct ramfs_node{
+    uint8_t *data;
+    size_t capacity;
+}ramfs_node_t;
+
+static void ramfs_memcpy(void *dest, const void *src, size_t n){
+    uint8_t *d = (uint8_t *)dest;
+    const uint8_t *s = (const uint8_t *)src;
+    while(n--) *d++ = *s++;
+}
+
+static int ramfs_open(vnode_t *node, int flags){
+    (void)flags;
+    return (node !=NULL) ? 0 : -1;
+}
+
+static int64_t ramfs_read(vnode_t *node, uint64_t offset, void *buf, size_t count){
+    if(!node || node->type != VNODE_TYPE_FILE) return -1;
+    if(offset >= node->size) return 0; // EOF
+
+    size_t read_bytes = count;
+    if(offset + read_bytes > node->size){
+        read_bytes = node->size - offset;
+    }
+
+    ramfs_node_t *rdata = (ramfs_node_t *)node->interanl_data;
+    if(!rdata || !rdata->data) return -1;
+
+    ramfs_memcpy(buf, rdata->data + offset, read_bytes);
+    return read_bytes;
+}
+
+static int64_t ramfs_write(vnode_t *node, uint64_t offset, const void *buf, size_t count){
+    if(!node || node->type !=VNODE_TYPE_FILE) return -1;
+    
+    ramfs_node_t *rdata = (ramfs_node_t *)node->interanl_data;
+    if(!rdata) return -1;
+
+    if(offset + count > rdata->capacity){
+        size_t new_cap = (offset + count) * 2;
+        if(new_cap < 128) new_cap = 128;
+
+        uint8_t *new_buf = (uint8_t *)kmalloc(new_cap);
+        if(!new_buf) return -1;
+
+        if(rdata->data){
+            ramfs_memcpy(new_buf, rdata->data, node->size);
+            kfree(rdata->data);
+        }
+        rdata->data = new_buf;
+        rdata->capacity = new_cap;
+    }
+
+    ramfs_memcpy(rdata->data + offset, buf, count);
+    if(offset + count > node->size){
+        node->size = offset + count;
+    }
+    return count;
+}
+
+static int ramfs_close(vnode_t *node){
+    (void)node;
+    return 0;
+}
+
+static int ramfs_create(vnode_t *parent, const char *name, vnode_type_t type, vnode_t **out_node);
+
+static vnode_ops_t ramfs_ops = {
+    .open = ramfs_open,
+    .read = ramfs_read,
+    .write = ramfs_write,
+    .close = ramfs_close,
+    .lookup = NULL,
+    .create = ramfs_create
+};
+
+static int ramfs_create(vnode_t *parent, const char *name, vnode_type_t type, vnode_t **out_node){
+    extern vnode_t* vfs_create_vnode(const char *name, vnode_type_t type, vnode_ops_t *ops);
+    extern void vfs_add_child(vnode_t *parent, vnode_t *child);
+
+    vnode_t *child = vfs_create_vnode(name, type, &ramfs_ops);
+    if(!child) return -1;
+
+    if(type == VNODE_TYPE_FILE){
+        ramfs_node_t *rdata = (ramfs_node_t *)kmalloc(sizeof(ramfs_node_t));
+        rdata->data = NULL;
+        rdata->capacity = 0;
+        child->interanl_data = rdata;
+    }
+
+    vfs_add_child(parent, child);
+    if(out_node) *out_node = child;
+
+    return 0;
+}
+
+vnode_t* ramfs_mount(const char *mount_point){
+    vnode_t *root = vfs_get_root;
+    vnode_t *mnt_node = NULL;
+
+    if(ramfs_create(root, mount_point, VNODE_TYPE_DIR, &mnt_node) < 0){
+        uart_puts("[RamFS ERROR] Failed to mount RamFS.\n");
+        return NULL;
+    }
+
+    uart_puts("[RamFS] Mounted successfully at /");
+    uart_puts(mount_point);
+    uart_puts("\n");
+
+    return mnt_node;
+}
+
+void ramfs_init(void){
+    ramfs_mount("ram");
+}
+-e 
+
+
+=== ./vfs/devfs.h ===
+#ifndef DEVFS_H
+#define DEVFS_H
+
+#include "vfs.h"
+
+void devfs_init(void);
+
+#endif-e 
+
+
+=== ./vfs/ramfs.h ===
+#ifndef RAMFS_H
+#define RAMFS_H
+
+#include "vfs.h"
+
+void ramfs_init(void);
+vnode_t* ramfs_mount(const char *mount_point);
+
+#endif-e 
+
+
+=== ./vfs/devfs.c ===
+#include "devfs.h"
+#include "uart.h"
+
+static int devfs_console_open(vnode_t *node, int flags){
+    (void)node;
+    (void)flags;
+    return 0;    
+}
+
+static int64_t devfs_console_read(vnode_t *node, uint64_t offset, void *buf, size_t count){
+    (void)node;
+    (void)offset;
+    (void)buf;
+    (void)count;
+
+    return 0;
+}
+static int64_t devfs_console_write(vnode_t *node, uint64_t offset, const void *buf, size_t count){
+    (void)node;
+    (void)offset;
+
+    const char *str = (const char *)buf;
+    for(size_t i = 0; i < count; i++){
+        uart_putc(str[i]);
+    }
+
+    return count;
+}
+
+static int devfs_console_close(vnode_t *node){
+    (void)node;
+    return 0;
+}
+
+static vnode_ops_t devfs_console_ops = {
+    .open = devfs_console_open,
+    .read = devfs_console_read,
+    .write = devfs_console_write,
+    .close = devfs_console_close,
+    .lookup = NULL,
+    .create = NULL
+};
+
+void devfs_init(void){
+    extern vnode_t* vfs_create_vnode(const char *name, vnode_type_t type, vnode_ops_t *ops);
+    extern void vfs_add_child(vnode_t *parent, vnode_t *child);
+
+    vnode_t *root = vfs_get_root();
+
+    //create /dev directory
+    vnode_t *dev_dir = vfs_create_vnode("dev", VNODE_TYPE_DIR, NULL);
+    vfs_add_child(root, dev_dir);
+
+    // create /dev/console device node and UART driver mapping
+    vnode_t *console_node = vfs_create_vnode("console",VNODE_TYPE_DEV, &devfs_console_ops);
+    vfs_add_child(dev_dir, console_node);
+
+    uart_puts("[DevFS] Mounted /dev/console (PL011 UART Device Node).\n");
+}
+-e 
+
+
+=== ./kernel/kernel.c ===
+#include "uart.h"
+#include "exception.h"
+#include "pmm.h"
+#include "heap.h"
+#include "mmu.h"
+#include "gic.h"
+#include "timer.h"
+#include "sched.h"
+#include "syscall.h"
+#include "vfs.h"
+#include "ramfs.h"
+#include "devfs.h"
+
+#ifdef ENABLE_TESTS
+#include "test.h"
+#endif
+
+extern char __stack_top[];
+extern char __kernel_end[];
+
+static inline uint64_t read_sp(void){
+    uint64_t sp;
+    asm volatile("mov %0, sp" : "=r"(sp));
+    return sp;
+}
+
+void kernel_main(void) {
+    
+    uart_init();
+    uart_puts("\n=======================================\n");
+    uart_puts("  MiniOS (ARM64) Successfully Booted!  \n");
+    uart_puts("=======================================\n");
+
+    exception_init();
+    uart_puts("[OK] Exception Vector Table Registered.\n");
+
+    pmm_init();
+    uart_puts("[OK] Physical Memory Manager (PMM) Initialized.\n");
+
+    heap_init();
+    uart_puts("[OK] Kernel Heap Allocator (kmalloc) Initialized.\n");
+
+    mmu_init();
+    uart_puts("[OK] ARM64 MMU & 4-Level Paging Activated.\n");
+
+#ifdef ENABLE_TESTS
+    uart_puts(">> Running Unit Tests...\n");
+    test_pmm_allocator();
+    test_heap_allocator();
+    test_mmu_virtual_memory();
+#endif
+    
+    gic_init();
+    uart_puts("[OK] GICv2 Interrupt Controller Initialized.\n");
+
+    timer_init(100);
+    uart_puts("[OK] ARM Generic Timer Initialized.\n");
+    
+    sched_init(read_sp());
+    uart_puts("[OK] Preemptive Scheduler Initialized.\n");
+
+    syscall_init();
+    uart_puts("[OK] System Call Table Initialized.\n");
+
+    vfs_init();
+    uart_puts("[OK] Virtual File System Infrastructure Initialized.\n");
+
+    ramfs_init();
+    uart_puts("[OK] RamFS Initialized and Mounted on /ram.\n");
+
+    devfs_init();
+    uart_puts("[OK] DevFS Initialized and Mounted on /dev.\n");
+
+    enable_irq();
+    uart_puts("[OK] CPU Global Interrupts Unmasked.\n");
+
+
+#ifdef ENABLE_TESTS
+    test_timer_ticks();
+    test_scheduler_preemption();
+    test_user_mode();
+    test_vfs_subsystem();
+#endif
+    uart_puts(">> Kernel is now in idle state.\n");
+
+    while (1)
+    {
+        asm volatile("wfi");
+    }
+
+}-e 
+
+
+=== ./kernel/exception.h ===
+#ifndef EXCEPTION_H
+#define EXCEPTION_H
+
+#include <stdint.h>
+
+typedef struct{
+    uint64_t x[30]; //240B
+    uint64_t lr; //8B
+    uint64_t elr_el1; //8B
+    uint64_t spsr_el1;//8B
+    uint64_t unused; //to packing for 272B 
+} trap_frame_t;
+
+void exception_init(void);
+
+static inline void enable_irq(void){
+    asm volatile("msr daifclr, #2" ::: "memory");//Bit 1 (I bit) clear -> enable IRQ
+
+}
+
+static inline void disable_irq(void){
+    asm volatile("msr daifset, #2" ::: "memory");//Bit 1 (I bit) set  -> disable IRQ
+}
+
+void handle_el1_sync(trap_frame_t *tf, uint64_t esr, uint64_t far);
+void handle_el1_irq(void);
+void handle_lower_sync(trap_frame_t *tf, uint64_t esr, uint64_t far);
+void handle_lower_irq(void);
+void handle_unknown_exception(trap_frame_t *tf, uint64_t esr, uint64_t far);
+
+#endif-e 
+
+
+=== ./kernel/exception.c ===
+#include <exception.h>
+#include <uart.h>
+#include <gic.h>
+#include <timer.h>
+#include <sched.h>
+#include <syscall.h>
+
+extern char exception_vector_table[];
+
+void exception_init(void)
+{
+    asm volatile("msr vbar_el1, %0" : : "r"(exception_vector_table) : "memory");
+    asm volatile("isb");
+}
+
+static const char* decode_exception_class(uint64_t ec){
+    switch(ec){
+        case 0x00: return "Unknown Reason";
+        case 0x01: return "Trapped WFI/WFE Instruction";
+        case 0x07: return "Trapped Access to SVE/Advanced SIMD/FP (FPU Trap)";
+        case 0x0E: return "Illegal  Execution state";
+        case 0x15: return "SVC Instruction Execution (Syscall AArch64)";
+        case 0x20: return "Instruction Abort (Lower EL)";
+        case 0x21: return "Instruction Abort (Current EL)";
+        case 0x22: return "PC Alignment Falult";
+        case 0x24: return "Data Abort (Lower EL)";
+        case 0x25: return "Data Abort (Current EL - Invalid Memory Access)";
+        case 0x26: return "SP Alignment Fault";
+        default:   return "Reversed / Unhandled Exception Class";
+    }
+}
+
+static void print_panic_dump(trap_frame_t *tf, uint64_t esr, uint64_t far, const char *title){
+    uint64_t ec = (esr >> 26) & 0x3F;
+
+    uart_puts("\n=======================================================\n");
+    uart_puts("                 [KERNEL PANIC OCCUREED]               \n");
+    uart_puts("=======================================================\n");
+    uart_puts("Type                 :"); uart_puts(title); uart_puts("\n");
+    uart_puts("Faulting PC (ELR)    :"); uart_put_hex(tf->elr_el1); uart_puts("\n");
+    uart_puts("Fault Address (FAR)  :"); uart_put_hex(far); uart_puts("\n");
+    uart_puts("Syndrome (ESR)       :"); uart_put_hex(esr); uart_puts("\n");
+    uart_puts("Class Description    :"); uart_puts(decode_exception_class(ec)); uart_puts("\n\n");
+
+    uart_puts("--- General Purpose Register (Trap Frame Dump) ----\n");
+    for(int i = 0;i < 30;i += 2){
+        uart_puts("X");
+        if(i < 10) uart_putc('0' + i);
+        else {uart_putc('0' + (i/10)); uart_putc('0' + (i%10));}
+        uart_puts(": ");
+        uart_put_hex(tf->x[i]);
+
+        uart_puts("    X");
+        if((i+1) < 10) uart_putc('0' + (i+1));
+        else {uart_putc('0' + ((i+1) / 10)); uart_putc('0' + ((i+1) % 10));}
+        uart_puts(": ");
+        uart_put_hex(tf->x[i+1]);
+        uart_puts("\n");
+    }
+    uart_puts("LR (X30) : "); uart_put_hex(tf->lr);
+    uart_puts("   SPSR_EL1: "); uart_put_hex(tf->spsr_el1);
+    uart_puts("\n=======================================================\n");
+}
+
+void handle_el1_sync(trap_frame_t *tf, uint64_t esr, uint64_t far){
+    print_panic_dump(tf, esr, far, "Synchronous Exception inside Kernel (EL1)");
+    while (1)
+    {
+        asm volatile("wfe");
+    }
+}
+
+void handle_el1_irq(void){
+    //to get irq_it
+    uint32_t irq_id = gic_acknowledge_irq();
+
+    if(irq_id >= 1020){
+        return;
+    }
+    if(irq_id == IRQ_TIMER_PHYS_NS){
+        timer_handle_irq();
+
+        gic_end_of_irq(irq_id);
+
+        sched_tick();
+        return;
+    }
+
+    gic_end_of_irq(irq_id);
+}
+
+void handle_lower_sync(trap_frame_t *tf, uint64_t esr, uint64_t far){
+    uint64_t ec = (esr >> 26) & 0x3F;
+
+    if(ec == 0x15){
+        syscall_dispatch(tf);
+        uart_puts("[SYSCALL] System Call Invoked from User Mode!\n");
+        return;
+    }
+
+    print_panic_dump(tf, esr, far, "User Space (EL0) Exception\n");
+    uart_puts("[KERNEL] Terminating Malicious/Faulty User Task...\n");
+    task_exit();
+}
+
+void handle_lower_irq(void){
+    uint32_t irq_id = gic_acknowledge_irq();
+
+    if(irq_id >= 1020){
+        return;
+    }
+    if(irq_id == IRQ_TIMER_PHYS_NS){
+        timer_handle_irq();
+
+        gic_end_of_irq(irq_id);
+
+        sched_tick();
+        return;
+    }
+
+    gic_end_of_irq(irq_id);
+}
+
+void handle_unknown_exception(trap_frame_t *tf, uint64_t esr, uint64_t far){
+    print_panic_dump(tf, esr, far, "Unknown / Unexpected Trap Vector");
+    while(1);
+}
+-e 
+
+
+=== ./kernel/memory_layout.h ===
+#ifndef MEMORY_LAYOUT_H
+#define MEMORY_LAYOUT_H
+
+#include <stdint.h>
+
+#define RAM_START       0x40000000ULL
+#define RAM_SIZE        0x08000000ULL
+#define RAM_END         (RAM_START +RAM_SIZE)
+
+#define PAGE_SIZE       0x1000ULL
+
+#define USER_START      0x47000000ULL
+#define USER_SIZE       0x01000000ULL
+#define USER_END        (USER_START + USER_SIZE)
+
+#define USER_STACK_TOP  0x47FFF000ULL
+
+
+#endif-e 
+
+
+=== ./test/test_user.c ===
+#include "test.h"
+#include "syscall.h"
+#include "sched.h"
+#include "uart.h"
+#include "task.h"
+
+//user RO data
+#define USER_RODATA \
+    __attribute__((section(".user_rodata"),aligned(16)))
+
+static const char user1_msg1[] USER_RODATA = "[User Task 1] Running in EL0.\n";
+static const char user1_msg2[] USER_RODATA = "[User Task 1] Yielding CPU.\n";
+static const char user1_msg3[] USER_RODATA = "[User Task 1] Back from yield. Sleeping 5 ticks.\n";
+static const char user1_msg4[] USER_RODATA = "[User Task 1] Wokr up. Exiting.\n";
+
+static const char user2_msg1[] USER_RODATA = "[User Task 1] Running in EL0.\n";
+static const char user2_msg2[] USER_RODATA = "[User Task 1] Work finished. Exiting.\n";
+
+//user code
+
+#define USER_TEXT \
+    __attribute__((section(".user_text"),aligned(16)))
+
+static void user_process_1(void) USER_TEXT;
+static void user_process_2(void) USER_TEXT;
+
+
+static void user_process_1(void){
+    //TEST SYS_GETPID
+    int64_t pid = sys_getpid();
+    (void)pid;
+
+    //TEST SYS_WRITE
+    sys_write(1,user1_msg1,sizeof(user1_msg1)-1);
+
+    //TEST SYS_YIELD
+    sys_write(1,user1_msg2,sizeof(user1_msg2)-1);
+    sys_yield();
+
+    
+    //TEST SYS_SLEEP
+    sys_write(1,user1_msg3,sizeof(user1_msg3)-1);
+    sys_sleep(5);
+    
+    //TEST WAKE_UP
+    sys_write(1,user1_msg4,sizeof(user1_msg4)-1);
+
+    //TEST SYS_EXIT
+    sys_exit(0);
+}
+
+static void user_process_2(void){
+    //TEST SYS_GETPID
+    int64_t pid = sys_getpid();
+    (void)pid;
+
+    //TEST SYS_WRITE
+    sys_write(1,user2_msg1,sizeof(user2_msg1)-1);
+
+    sys_write(1,user2_msg2,sizeof(user2_msg2)-1);
+  
+    //TEST SYS_EXIT
+    sys_exit(0);
+}
+
+void test_user_mode(void){
+    uart_puts("\n[TEST] ================================================\n");
+
+    uart_puts("[TEST]      Starting Phase 6: User Mode (EL0) & SVC\n");
+
+    uart_puts("[TEST] ================================================\n");
+
+
+    task_struct_t *task1 =task_create_user(user_process_1);
+
+    task_struct_t *task2 =task_create_user(user_process_2);
+
+
+    if(!task1 || !task2)
+    {
+        uart_puts("[TEST] [FAIL] Failed to create User Tasks!\n");
+        return;
+    }
+
+
+    uart_puts("[TEST] User Tasks Created.\n");
+
+    uart_puts("[TEST] Waiting for User Tasks...\n");
+
+
+    while(sched_get_live_user_tasks() != 0)
+    {
+        asm volatile("wfi");
+    }
+
+
+    uart_puts("[TEST] [PASS] User Mode (EL0) & System Calls Verified!\n");
+
+    uart_puts("=======================================================\n\n");
+}-e 
+
+
+=== ./test/test_exception.c ===
+#include "uart.h"
+#include <stdint.h>
+
+void test_exception_abort(void){
+    uart_puts("\n[TEST]------------------------------------\n");
+    uart_puts("\n[TEST] Triggering Intentional Data Abort...\n");
+    uart_puts("\n[TEST]------------------------------------\n");
+
+    volatile uint64_t *invalid_addr = (volatile uint64_t *)0XDEADBEEF0000;
+    *invalid_addr = 0X12345678;
+
+    uart_puts("[FAIL] This message must NOT be printed.\n");
+}-e 
+
+
+=== ./test/test_vfs.c ===
+#include "test.h"
+#include "vfs.h"
+#include "syscall.h"
+#include "uart.h"
+
+void user_vfs_test_task(void) {
+    sys_write(1, "\n[USER TASK] Starting VFS & RamFS & DevFS Test in EL0...\n", 57);
+
+    // 1. DevFS (/dev/console) 쓰기 테스트
+    int console_fd = (int)sys_open("/dev/console", O_WRONLY);
+    if (console_fd >= 0) {
+        sys_write(console_fd, "[TEST PASS] Writing directly to /dev/console via DevFS!\n", 56);
+        sys_close(console_fd);
+    } else {
+        sys_write(1, "[TEST FAIL] Failed to open /dev/console\n", 40);
+    }
+
+    // 2. RamFS (/ram/hello.txt) 파일 생성 및 쓰기/읽기 검증
+    int file_fd = (int)sys_open("/ram/hello.txt", O_CREAT | O_RDWR);
+    if (file_fd >= 0) {
+        const char *msg = "MiniOS AArch64 VFS Framework Operational!";
+        sys_write(file_fd, msg, 42);
+        sys_close(file_fd);
+
+        // 파일 재오픈 후 읽기 검증
+        int read_fd = (int)sys_open("/ram/hello.txt", O_RDONLY);
+        if (read_fd >= 0) {
+            char read_buf[64] = {0};
+            int64_t read_bytes = sys_read(read_fd, read_buf, 64);
+            sys_close(read_fd);
+
+            if (read_bytes > 0) {
+                sys_write(1, "[TEST PASS] Read from /ram/hello.txt: \"", 39);
+                sys_write(1, read_buf, read_bytes);
+                sys_write(1, "\"\n", 2);
+            }
+        }
+    } else {
+        sys_write(1, "[TEST FAIL] Failed to create /ram/hello.txt\n", 44);
+    }
+
+    sys_write(1, ">> VFS Infrastructure Integration Tests Completed Successfully!\n\n", 64);
+    sys_exit(0);
+}-e 
+
+
+=== ./test/test_timer.c ===
+#include "test.h"
+#include "timer.h"
+#include "uart.h"
+
+void test_timer_ticks(void) {
+    uart_puts("\n[TEST] ================================================\n");
+    uart_puts("[TEST]    Starting Hardware Timer & GICv2 Unit Tests   \n");
+    uart_puts("[TEST] ================================================\n");
+
+    uint64_t start_tick = timer_get_ticks();
+    uart_puts("[TEST] Waiting for 10 Timer Ticks (~100ms)...\n");
+
+    // 10틱(약 100ms) 대기
+    timer_sleep_ticks(10);
+    
+
+    uint64_t end_tick = timer_get_ticks();
+    uart_puts("[TEST] Start Tick: ");
+    uart_put_hex(start_tick);
+    uart_puts(" -> End Tick: ");
+    uart_put_hex(end_tick);
+    uart_puts("\n");
+
+    if (end_tick >= start_tick + 10) {
+        uart_puts("[TEST] [PASS] Hardware Timer & Interrupt Processing OK!\n");
+    } else {
+        uart_puts("[TEST] [FAIL] Timer Ticks did not increase properly!\n");
+    }
+    uart_puts("=======================================================\n\n");
+}-e 
+
+
+=== ./test/test_sched.c ===
+#include "test.h"
+#include "sched.h"
+#include "timer.h"
+#include "uart.h"
+
+static volatile int task_a_counter = 0;
+static volatile int task_b_counter = 0;
+
+static void task_worker_a(void) {
+    while (task_a_counter < 3) {
+        uart_puts("  [Task A] Executing... tick=");
+        uart_put_hex(timer_get_ticks());
+        uart_puts("\n");
+        task_a_counter++;
+        timer_sleep_ticks(10);
+    }
+    uart_puts("  [Task A] Work Finished -> Exiting.\n");
+}
+
+static void task_worker_b(void) {
+    while (task_b_counter < 3) {
+        uart_puts("  [Task B] Executing... tick=");
+        uart_put_hex(timer_get_ticks());
+        uart_puts("\n");
+        task_b_counter++;
+        timer_sleep_ticks(10);
+    }
+    uart_puts("  [Task B] Work Finished -> Exiting.\n");
+}
+
+void test_scheduler_preemption(void) {
+    uart_puts("\n[TEST] ================================================\n");
+    uart_puts("[TEST]    Starting Multitasking & Scheduler Tests      \n");
+    uart_puts("[TEST] ================================================\n");
+
+    task_create(task_worker_a);
+    task_create(task_worker_b);
+
+    uart_puts("[TEST] Tasks Created. Waiting for Preemptive Context Switches...\n");
+
+    while (task_a_counter < 3 || task_b_counter < 3) {
+        asm volatile("wfi");
+    }
+
+    uart_puts("[TEST] [PASS] Preemptive Multitasking Successfully Verified!\n");
+    uart_puts("=======================================================\n\n");
+}-e 
+
+
+=== ./test/test.h ===
+#ifndef TEST_H
+#define TEST_H
+
+void test_exception_abort(void);
+void test_pmm_allocator(void);
+void test_heap_allocator(void);
+void test_mmu_virtual_memory(void);
+void test_timer_ticks(void);
+void test_scheduler_preemption(void);
+void test_user_mode(void);
+
+#endif-e 
+
+
+=== ./test/test_pmm.c ===
+#include "test.h"
+#include "pmm.h"
+#include "uart.h"
+
+void test_pmm_allocator(void){
+    uart_puts("\n[TEST] --- starting PMM Unit Tests --- \n");
+
+    uint64_t initial_free = pmm_get_free_pages();
+    uart_puts("[TEST] Initial Free pages:");
+    uart_put_hex(initial_free);
+    uart_puts("\n");
+
+    void *page1 = pmm_alloc_page();
+    void *page2 = pmm_alloc_page();
+
+    uart_puts("[TEST] Allocated page 1: ");
+    uart_put_hex((uint64_t)page1);
+    uart_puts("\n");
+
+    uart_puts("[TEST] Allocated page 2: ");
+    uart_put_hex((uint64_t)page2);
+    uart_puts("\n");
+
+    pmm_free_page(page1);
+    void *page1_realloc = pmm_alloc_page();
+    uart_puts("[TEST] Re-allocated page: ");
+    uart_put_hex((uint64_t)page1_realloc);
+    uart_puts(" (Expected same as Page 1)\n");
+
+
+    void *multi_pages = pmm_alloc_pages(4);
+    uart_puts("[TEST] Allocated 4 pages: ");
+    uart_put_hex((uint64_t)multi_pages);
+    uart_puts("\n");
+
+    pmm_free_pages(multi_pages, 4);
+    pmm_free_page(page2);
+    pmm_free_page(page1_realloc);
+
+    uint64_t final_free = pmm_get_free_pages();
+    uart_puts("[TEST] Final Free Pages  : ");
+    uart_put_hex(final_free);
+    uart_puts("\n");
+
+    if (initial_free == final_free) {
+        uart_puts("[TEST] [PASS] PMM All Tests Passed Successfully!\n\n");
+    } else {
+        uart_puts("[TEST] [FAIL] Memory Leak Detected in PMM!\n\n");
+    }
+
+}-e 
+
+
+=== ./test/test_heap.c ===
+#include "test.h"
+#include "heap.h"
+#include "uart.h"
+
+void test_heap_allocator(void){
+    uart_puts("\n[TEST] --- Starting Kernel Heap (kmalloc/kfree) Unit Tests --- \n");
+
+    void *ptr1 = kmalloc(32);
+    void *ptr2 = kmalloc(128);
+    void *ptr3 = kmalloc(512);
+
+    uart_puts("[TEST] kmalloc(32) Address: ");
+    uart_put_hex((uint64_t)ptr1);
+    uart_puts("\n");
+   
+    uart_puts("[TEST] kmalloc(128) Address: ");
+    uart_put_hex((uint64_t)ptr2);
+    uart_puts("\n");
+    
+    uart_puts("[TEST] kmalloc(512) Address: ");
+    uart_put_hex((uint64_t)ptr3);
+    uart_puts("\n");
+
+    uint8_t *byte_arr = (uint8_t *)ptr1;
+    for(int i = 0; i < 32; i++){
+        byte_arr[i] = (uint8_t)(0xAA + i);
+    }
+    
+    int read_ok = 1;
+    for(int i = 0; i < 32; i++){
+        if(byte_arr[i] != (uint8_t)(0xAA + i)){
+            read_ok = 0;
+            break;
+        }
+    }
+    if(read_ok){
+        uart_puts("[TEST] Data Write/Read Test : PASS\n");
+    }
+    else{
+        uart_puts("[TEST] Data Write/Read Test : FAIL\n");
+    }
+
+    kfree(ptr1);
+    kfree(ptr2);
+    kfree(ptr3);
+
+    void *ptr_merged = kmalloc(600);
+    uart_puts("[TEST] kmalloc(600) (Reused): ");
+    uart_put_hex((uint64_t)ptr_merged);
+    uart_puts(" (Expected start near ptr1)\n");
+
+    kfree(ptr_merged);
+    uart_puts("[TEST] [PASS] Heap Allocator Tests Completed Successfully!\n\n");
+
+}-e 
+
+
+=== ./test/test_mmu.c ===
+#include <test.h>
+#include <mmu.h>
+#include <pmm.h>
+#include <uart.h>
+
+static void print_subtest(const char *name, int pass){
+    uart_puts("  ->  ");
+    uart_puts(name);
+    if(pass)    uart_puts(": [PASS]\n");
+    else        uart_puts(": [FAIL]\n");
+}
+
+
+
+void test_mmu_virtual_memory(void){
+    uart_puts("\n[TEST] ================================================\n");
+    uart_puts("[TEST]       Starting Comprehensive MMU Unit Tests     \n");
+    uart_puts("[TEST] ================================================\n");
+
+    uint64_t *root = mmu_get_root_table();
+    int overall_pass = 1;
+
+    //page table walk test
+    uart_puts("[1] Page Table Hardware Walk Test\n\n");
+
+    uint64_t pa_ram = mmu_translate(root, 0x40000000);
+    uint64_t pa_uart = mmu_translate(root, 0x09000000);                                      
+    uint64_t pa_unmapped = mmu_translate(root, 0x55000000);
+    
+
+    int test1_ok = (pa_ram == 0x40000000) && (pa_uart == 0x09000000) && (pa_unmapped == 0);
+
+    print_subtest("RAM/UART Translation & Unmapped Space Detection", test1_ok);
+    if (!test1_ok) overall_pass = 0;
+
+
+    //Non Identity mapping test
+    uart_puts("[2] Non-Identity Dynamic Mapping Test (VA != PA)\n");
+    void *phys_frame = pmm_alloc_page();
+    uint64_t test_va = 0x50000000ULL;
+
+    mmu_map_page(root, test_va, (uint64_t)phys_frame, MMU_FLAG_RAM);
+    
+
+    mmu_tlb_flush();
+
+    *(volatile uint64_t *)test_va = 0xFEEDC0FFEE123456ULL;
+    
+    uint64_t direct_read = *(volatile uint64_t *)phys_frame;
+    int test2_ok = (direct_read == 0xFEEDC0FFEE123456ULL);
+
+    *(volatile uint64_t *)phys_frame = 0xABCDEF0123456789ULL;
+    if (*(volatile uint64_t *)test_va != 0xABCDEF0123456789ULL) {
+        test2_ok = 0;
+    }
+    print_subtest("Bi-directional Translation Consistency (VA <-> PA)", test2_ok);
+    if (!test2_ok) overall_pass = 0;
+
+    // stress test for crossing 4KB page boundaries
+    uart_puts("[3] Multi-Page Boundary Stress Test\n");
+    void *multi_phys = pmm_alloc_pages(2);
+    uint64_t multi_va = 0x60000000ULL;
+
+    mmu_map_range(root, multi_va, (uint64_t)multi_phys, PAGE_SIZE * 2, MMU_FLAG_RAM);
+    mmu_tlb_flush();
+
+    volatile uint64_t *cross_boundary_ptr = (volatile uint64_t *)(multi_va + PAGE_SIZE - 4);
+    *cross_boundary_ptr = 0xAABBCCDDEEFF0011ULL;
+
+    int test3_ok = (*cross_boundary_ptr == 0xAABBCCDDEEFF0011ULL);
+    print_subtest("Cross-Page Boundary 64-bit Memory Access", test3_ok);
+    if (!test3_ok) overall_pass = 0;
+
+
+    //page remapping and TLB invalidation
+    uart_puts("[4] Dynamic Remapping & TLB Invalidation Test\n");
+    void *new_phys = pmm_alloc_page();
+    *(volatile uint64_t *)new_phys = 0x777788889999AAAAULL;
+
+    mmu_map_page(root, test_va, (uint64_t)new_phys, MMU_FLAG_RAM);
+    mmu_tlb_flush();
+
+    int test4_ok = (*(volatile uint64_t *)test_va == 0x777788889999AAAAULL);
+    print_subtest("TLB Flush and Remapped Page Visibility", test4_ok);
+    if (!test4_ok) overall_pass = 0;
+
+
+    //resource deallocation and cleanup
+    pmm_free_page(phys_frame);
+    pmm_free_pages(multi_phys, 2);
+    pmm_free_page(new_phys);
+
+    uart_puts("-------------------------------------------------------\n");
+    if (overall_pass) {
+        uart_puts("[TEST] [PASS] ALL MMU & PAGING TESTS COMPLETED SUCCESSFULLY!\n");
+    } else {
+        uart_puts("[TEST] [FAIL] MMU UNIT TESTS FAILED!\n");
+    }
+    uart_puts("=======================================================\n\n");
+
+}
+-e 
+
+
+=== ./pmm/pmm.c ===
+#include "pmm.h"
+#include "uart.h"
+#include <stddef.h>
+#include "memory_layout.h"
+
+
+extern char __kernel_end[];
+
+extern char __user_image_start[];
+extern char __user_image_end[];
+
+static uint64_t *bitmap = 0;
+static uint64_t total_pages = 0;
+static uint64_t bitmap_total_words = 0;
+static uint64_t usable_start_addr = 0;
+
+static inline void bitmap_set(uint64_t page_idx){
+    bitmap[page_idx/64] |= (1ULL << (page_idx % 64));
+}
+
+static inline void bitmap_clear(uint64_t page_idx){
+    bitmap[page_idx/64] &= ~(1ULL << (page_idx % 64));
+}
+
+static inline int bitmap_test(uint64_t page_idx){
+    return (bitmap[page_idx / 64] & (1ULL <<(page_idx % 64))) != 0; // it is in there = 1, if not =0
+}
+
+static void pmm_memzero(void *dst, size_t size){
+    uint8_t *p = (uint8_t *)dst;
+    while (size--)
+    {
+        *p++ = 0;
+    }
+    
+}
+
+void pmm_init(void){
+    total_pages = (RAM_END - RAM_START) / PAGE_SIZE;
+
+    bitmap_total_words = (total_pages + 63) / 64;
+    uint64_t bitmap_size_bytes = bitmap_total_words * sizeof(uint64_t);
+
+    //locate bitmap -> kernel_end
+    bitmap = (uint64_t *)(((uint64_t)__kernel_end + 7) & ~7ULL);
+    
+    //set all bits in the bitmap to 1
+    for (uint64_t i = 0; i < bitmap_total_words; i++){
+        bitmap[i] = ~0ULL;
+    }
+
+    uint64_t free_start  = (uint64_t)bitmap + bitmap_size_bytes;
+    usable_start_addr = (free_start + PAGE_SIZE -1) & ~(PAGE_SIZE - 1);
+
+    uint64_t start_page_idx = (usable_start_addr - RAM_START) / PAGE_SIZE; //to get page num
+   
+    for(uint64_t i = start_page_idx; i<total_pages; i++){
+        bitmap_clear(i);
+    }
+    //user image pmm reserved
+    uint64_t user_start = ((uint64_t)__user_image_start & ~(PAGE_SIZE -1));
+    uint64_t user_end = ((uint64_t)__user_image_end + PAGE_SIZE -1) & ~(PAGE_SIZE -1);
+
+    if(user_start < RAM_END && user_end > RAM_START){
+        if(user_start < RAM_START)
+            user_start = RAM_START;
+        if(user_end > RAM_END)
+            user_end =RAM_END;
+
+        uint64_t first_page = (user_start - RAM_START) / PAGE_SIZE;
+        uint64_t last_page = (user_end - RAM_START) / PAGE_SIZE;
+        
+        for(uint64_t i =first_page; i <last_page; i++){
+            bitmap_set(i);
+        }
+    }
+    uart_puts("[PMM] User image pages reserved.\n");
+}
+
+void *pmm_alloc_pages(uint64_t count){
+    if (count == 0) return 0;
+
+    uint64_t start_page_idx = (usable_start_addr - RAM_START) / PAGE_SIZE;
+    size_t found_count = 0;
+    uint64_t found_start_idx = 0;
+
+    for(uint64_t i = start_page_idx ; i < total_pages ; i++){
+        if(!bitmap_test(i)){//bitmap is empty(not allocated)
+            if(found_count == 0){
+                found_start_idx = i;
+            }
+            found_count++;
+            
+            if(found_count == count){ //allocation is done
+                for(uint64_t j = found_start_idx; j<found_start_idx + count ;j++){
+                    bitmap_set(j);
+                }
+                void *addr = (void *)(RAM_START + (found_start_idx * PAGE_SIZE));
+                pmm_memzero(addr, count * PAGE_SIZE);
+                return addr; //return start_allocation addr
+            }
+        }
+        else{//restart to find contiguous memory
+            found_count =0;
+        }
+    }        
+    return 0;
+}
+
+
+void *pmm_alloc_page(void){
+    return pmm_alloc_pages(1);
+}
+
+
+void pmm_free_pages(void *ptr, size_t count){
+    uint64_t addr = (uint64_t)ptr;
+
+    if(ptr == 0 || addr < usable_start_addr || addr >= RAM_END || (addr & (PAGE_SIZE - 1)) !=0){
+        return;
+    }
+
+    uint64_t page_idx = (addr - RAM_START) / PAGE_SIZE;
+    for(size_t i = 0; i<count ; i++){
+        if((page_idx + i) < total_pages){
+            bitmap_clear(page_idx + i);
+        }
+    }
+}
+
+void pmm_free_page(void *ptr){
+    return pmm_free_pages(ptr, 1);
+}
+
+uint64_t pmm_get_free_pages(void){
+    uint64_t free_cnt = 0;
+    uint64_t start_page_idx = (usable_start_addr - RAM_START) / PAGE_SIZE;
+    for(uint64_t i =start_page_idx; i < total_pages; i++){
+        if(!bitmap_test(i)){
+            free_cnt++;
+        }
+    }
+    return free_cnt;
+}
+
+-e 
+
+
+=== ./pmm/pmm.h ===
+#ifndef PMM_H
+#define PMM_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+#include "memory_layout.h"
+
+void pmm_init(void);
+void *pmm_alloc_page(void);
+void *pmm_alloc_pages(size_t count);
+void pmm_free_page(void *ptr);
+void pmm_free_pages(void *ptr, size_t count);
+
+uint64_t pmm_get_free_pages(void);
+
+#endif-e 
+
+
+=== ./heap/heap.c ===
+#include "heap.h"
+#include "pmm.h"
+#include "uart.h"
+
+static block_header_t *heap_start = 0;
+
+#define INITIAL_HEAP_PAGES 4
+
+void heap_init(void){
+    void *initial_mem = pmm_alloc_pages(INITIAL_HEAP_PAGES);
+    if(!initial_mem){
+        uart_puts("[HEAP ERROR] Failed to allocate physical memory for Heap!\n");
+        return;
+    }
+
+    heap_start = (block_header_t *)initial_mem;
+    heap_start->size = (INITIAL_HEAP_PAGES * PAGE_SIZE) - HEADER_SIZE;
+    heap_start->is_free = 1;
+    heap_start->next = 0;
+}
+
+
+void *kmalloc(size_t size){
+    if(size == 0) return 0;
+
+    size_t aligned_size = ALIGN_UP16(size);//aligned 16bytes
+    block_header_t *curr = heap_start;
+
+    while(curr){
+        if(curr->is_free && (curr->size) >= aligned_size){
+            if((curr->size) >= aligned_size + HEADER_SIZE + HEAP_ALIGNMENT){
+                block_header_t *new_block = (block_header_t *)((uint8_t *)curr + HEADER_SIZE + aligned_size);
+                new_block->size = curr->size - aligned_size - HEADER_SIZE;
+                new_block->is_free = 1;
+                new_block->next = curr->next;
+
+                curr->size = aligned_size;
+                curr->next = new_block;
+            }
+            curr->is_free = 0;
+
+            return (void *)((uint8_t *)curr + HEADER_SIZE);
+        }
+        curr = curr->next;
+    }
+
+    size_t pages_needed = (aligned_size + HEADER_SIZE + PAGE_SIZE - 1) / PAGE_SIZE;
+    void *new_pages = pmm_alloc_pages(pages_needed);
+    if(!new_pages){
+        uart_puts("[HEAP ERROR] Out of Memory in kmalloc!\n");
+        return 0;
+    }
+
+    block_header_t *expanded_block = (block_header_t *)new_pages;
+    expanded_block->size = (pages_needed * PAGE_SIZE) - HEADER_SIZE;
+    expanded_block->is_free=0;
+    expanded_block->next = 0;
+
+    curr = heap_start;
+    while (curr->next)
+    {
+        curr = curr->next;
+    }
+    curr->next = expanded_block;
+
+    return (void *)((uint8_t *)expanded_block + HEADER_SIZE);
+}
+
+void kfree(void *ptr){
+    if(!ptr) return;
+
+    block_header_t *header = (block_header_t *)((uint8_t *)ptr - HEADER_SIZE);
+    header->is_free = 1;
+
+    block_header_t *curr = heap_start;
+    while(curr && curr->next){
+        if(curr->is_free && curr->next->is_free){
+            if((uint8_t *)curr + HEADER_SIZE + curr->size == (uint8_t *)curr->next){
+                curr->size += HEADER_SIZE + curr->next->size;
+                curr->next = curr->next->next;
+                continue;
+            }
+        }
+        curr = curr->next;
+    }
+
+}-e 
+
+
+=== ./heap/heap.h ===
+#ifndef HEAP_H
+#define HEAP_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+#define HEAP_ALIGNMENT 16
+#define ALIGN_UP16(size) (((size) + (HEAP_ALIGNMENT - 1)) & ~(HEAP_ALIGNMENT - 1))
+
+typedef struct block_header{
+    size_t size;
+    int is_free;
+    struct block_header *next;
+    uint64_t padding;
+} block_header_t;
+
+#define HEADER_SIZE (sizeof(block_header_t))
+
+void heap_init(void);
+void *kmalloc(size_t size);
+void kfree(void *ptr);
+
+#endif-e 
+
+
+=== ./gic/gic.c ===
+#include "gic.h"
+
+
+//32bits MMIO memory access helper
+static inline void mmio_write32(uint64_t addr, uint32_t val){
+    *(volatile uint32_t*)addr = val;
+}
+
+static inline uint32_t mmio_read32(uint64_t addr){
+    return *(volatile uint32_t*)addr;
+}
+
+//8bits MMIO memory acceess helper to set priority
+static inline void mmio_write8(uint64_t addr, uint8_t val){
+    *(volatile uint8_t *)addr = val;
+}
+
+void gic_init(void){
+    //GICD disable for setting
+    mmio_write32(GICD_BASE + GICD_CTLR, 0);
+
+    //disable all of the Interrupt
+    for(int i=0;i<4;i++){
+        mmio_write32(GICD_BASE + GICD_ICENABLER + (i * 4), 0xFFFFFFFF);
+    }
+
+    for(int i=0;i<4;i++){
+        mmio_write32(GICD_BASE + GICD_IGROUPR + (i * 4), 0xFFFFFFFF);
+    }
+
+    //enable distributor
+    mmio_write32(GICD_BASE + GICD_CTLR, 0x3);
+
+    //cpu interface priority
+    mmio_write32(GICC_BASE + GICC_PMR, 0xFF);
+
+    //cpu interface enable
+    mmio_write32(GICC_BASE + GICC_CTLR, 0x7);
+}
+
+void gic_enable_interrupt(uint32_t irq_id){
+    //Set prority
+    //0x80 => middle priority
+    uint32_t prio_reg = GICD_BASE + GICD_IPRIORITYR + (irq_id & ~0x3U);
+    uint32_t shift = (irq_id % 4) * 8;
+    uint32_t val = mmio_read32(prio_reg);
+    val &= ~(0xFFU << shift);
+    val |= (0x80U << shift);
+    mmio_write32(prio_reg, val);
+
+    if(irq_id >=32){
+        mmio_write8(GICD_BASE + GICD_ITARGETSR + irq_id, 0x01);
+    }
+
+    //IRQ enable
+    uint32_t reg_idx = irq_id / 32;
+    uint32_t bit_offset = irq_id % 32;
+    mmio_write32(GICD_BASE + GICD_ISENABLER + (reg_idx * 4), (1U << bit_offset));
+}
+
+//If interrupt occured > IRQ Num check
+uint32_t gic_acknowledge_irq(void){
+    return mmio_read32(GICC_BASE + GICC_IAR) & 0x3FF;
+}
+
+//End of Interrupt
+void gic_end_of_irq(uint32_t irq_id){
+    mmio_write32(GICC_BASE + GICC_EOIR, irq_id);
+}
+
+
+
+-e 
+
+
+=== ./gic/gic.h ===
+#ifndef GIC_H
+#define GIC_H
+
+#include <stdint.h>
+
+#define GICD_BASE 0x08000000ULL //Distributor base addr
+#define GICC_BASE 0x08010000ULL //CPU interface base addr
+
+// GICD(Distributor) register offset
+#define GICD_CTLR       0x000   //Distributor Control
+#define GICD_TYPER      0x004   //Controller Type
+#define GICD_IGROUPR    0x080   //Interrupt Group Register
+#define GICD_ISENABLER  0x100   //Interrupt Set-enable
+#define GICD_ICENABLER  0x180   //Interrupt Clear-enable
+#define GICD_IPRIORITYR 0x400   //Interrupt Priority
+#define GICD_ITARGETSR  0x800   //Interrupt Targets
+
+// GICC(CPU Interface) register offset
+#define GICC_CTLR       0x0000  //CPU Interface Control
+#define GICC_PMR        0x0004  //Interrupt Priority Mask
+#define GICC_IAR        0x000C  //Interrupt Acknowledge
+#define GICC_EOIR       0x0010  //End of Interrupt
+
+//SYS Interrupt Num
+#define IRQ_TIMER_PHYS_NS   30  //ARM Generic Timer Non-Secure Physical IRQ(PPI 14)
+
+void gic_init(void);
+void gic_enable_interrupt(uint32_t irq_id);
+uint32_t gic_acknowledge_irq(void);
+void gic_end_of_irq(uint32_t irq_id);
+
+
+#endif-e 
+
+=== ./uart/uart.c ===
+#include "uart.h"
+
+void uart_init(void){
+    *UARTCR = 0x0;
+
+    /*  Baudrate setting base 115200 - 24MHz
+        IBRD = 24000000 / (16 * 115200) = 13.0208 -> 13
+        FBRD = 0.0208 * 64 = 1.33 -> 1 */
+    *UARTIBRD = 13;
+    *UARTFBRD = 1;
+
+    *UARTLCR_H = (1<<4) | (3<<5);
+
+    *UARTCR = (1<<0) | (1<<8) | (1<<9);
+}
+
+void uart_putc(char c){
+    while (*UARTFR & FR_TXFF);
+
+    if(c=='\n'){
+        *UARTDR = '\r';
+        while (*UARTFR & FR_TXFF);
+    }
+    *UARTDR = (uint32_t)c;
+}
+
+void uart_puts(const char *s){
+    while(*s){
+        uart_putc(*s++);
+    }
+}
+
+void uart_put_hex(uint64_t val){
+    const char hex_chars[] = "0123456789ABCDEF";
+    uart_puts("0x");
+    for(int i = 60; i >= 0; i -= 4){
+        uart_putc(hex_chars[(val >> i) & 0xF]);
+    }
+}
+
+-e 
+
+
+=== ./uart/uart.h ===
+#ifndef UART_H
+#define UART_H
+
+#include <stdint.h>
+
+#define UART0_BASE 0x09000000
+
+#define UARTDR      ((volatile uint32_t *)(UART0_BASE + 0x00)) //Data Register for rx tx
+#define UARTFR      ((volatile uint32_t *)(UART0_BASE + 0x18)) //Flag Register for state flag
+#define UARTIBRD    ((volatile uint32_t *)(UART0_BASE + 0x24)) //Interger Baud Rate Divisior
+#define UARTFBRD    ((volatile uint32_t *)(UART0_BASE + 0x28)) //Fractional Baud Rate Divisior
+#define UARTLCR_H   ((volatile uint32_t *)(UART0_BASE + 0x2C)) //Line Control Register
+#define UARTCR      ((volatile uint32_t *)(UART0_BASE + 0x30)) //Control Register
+
+#define FR_TXFF (1<<5) //Transmit FIFO Full
+#define FR_RXFE (1<<4) //Receive FIFO Empty
+
+void uart_init(void);
+void uart_putc(char c);
+void uart_puts(const char *s);
+void uart_put_hex(uint64_t val);
+
+#endif-e 
+
+
+=== ./docs/implementation.md ===
+[Phase 1: Boot & I/O] ──► [Phase 2: Exception] ──► [Phase 3: Memory (MMU)]
+(부트/스택/UART) [완료]    (벡터테이블/패닉덤프) [완료] (PMM / kmalloc / 페이징) [완료]
+                                                              │
+                                                              ▼
+[Phase 6: User Mode]  ◄── [Phase 5: Scheduling] ◄── [Phase 4: Interrupt]
+(EL0 / SVC 시스템콜)[완료]       (PCB / 선점형 스케줄러)[완료]   (GIC / ARM Generic Timer) [완료]
+        │
+        ▼
+[Phase 7: Storage & VFS] ──► [Phase 8: Shell & Apps]
+(RamFS / Initramfs / VFS)     (ELF 로더 / Mini C Lib / 쉘)-e 
+
+
+=== ./mmu/mmu.c ===
+#include "mmu.h"
+#include "pmm.h"
+#include "uart.h"
+
+static uint64_t *l0_root = 0;
+
+
+static void mmu_memzero(void *dst, size_t size){
+    uint8_t*p = (uint8_t *)dst;
+    while (size--)
+    {
+        *p++=0;
+    }
+}
+
+
+uint64_t *mmu_get_root_table(void){
+    return l0_root;
+}
+
+void mmu_tlb_flush(void){
+    asm volatile(
+        "dsb ish\n"
+        "tlbi vmalle1\n"
+        "dsb ish\n"
+        "isb\n"
+        ::: "memory"
+    );
+}
+
+uint64_t mmu_translate(uint64_t *l0_table, uint64_t va){
+    if(!l0_table) return 0;
+
+    uint64_t l0_entry = l0_table[L0_INDEX(va)];
+    if(!(l0_entry & 0x1)) return 0;
+
+    uint64_t *l1_table = (uint64_t *)(l0_entry & 0x0000FFFFFFFFF000ULL);
+    uint64_t l1_entry = l1_table[L1_INDEX(va)];
+    if(!(l1_entry & 0x1)) return 0;    
+
+    uint64_t *l2_table = (uint64_t *)(l1_entry & 0x0000FFFFFFFFF000ULL);
+    uint64_t l2_entry = l2_table[L2_INDEX(va)];
+    if(!(l2_entry & 0x1)) return 0;
+    
+    uint64_t *l3_table = (uint64_t *)(l2_entry & 0x0000FFFFFFFFF000ULL);
+    uint64_t l3_entry = l3_table[L3_INDEX(va)];
+    if(!(l3_entry & 0x1)) return 0;
+
+    return (l3_entry & 0x0000FFFFFFFFF000ULL) | (va & 0xFFFULL);
+}
+
+static uint64_t* get_or_create_table(uint64_t *parent_table, uint64_t index){
+    uint64_t entry = parent_table[index];
+
+    if(entry & 0x1){// If page aleady exists >>  return addr
+        return (uint64_t *)(entry & 0x0000FFFFFFFFF000ULL);
+    }
+
+    void *new_table = pmm_alloc_page();
+    if(!new_table){
+        uart_puts("[MMU ERROR] Out of Memory while allocting page table!\n");
+        return 0;
+    }
+
+    mmu_memzero(new_table, PAGE_SIZE);
+
+    parent_table[index] = ((uint64_t)new_table & 0x0000FFFFFFFFF000ULL) | MMU_DESCRIPTOR_TABLE;
+    return (uint64_t *)new_table;
+}
+
+void mmu_map_page(uint64_t *l0_table, uint64_t va, uint64_t pa, uint64_t flags){
+    uint64_t l0_idx = L0_INDEX(va);
+    uint64_t l1_idx = L1_INDEX(va);
+    uint64_t l2_idx = L2_INDEX(va);
+    uint64_t l3_idx = L3_INDEX(va);
+
+    uint64_t *l1_table = get_or_create_table(l0_table, l0_idx);
+    uint64_t *l2_table = get_or_create_table(l1_table, l1_idx);
+    uint64_t *l3_table = get_or_create_table(l2_table, l2_idx);
+
+    l3_table[l3_idx] = (pa & 0x0000FFFFFFFFF000ULL) | flags;
+}
+
+void mmu_map_range(uint64_t *l0_table, uint64_t va_start, uint64_t pa_start, size_t size, uint64_t flags){    
+    uint64_t va = va_start & ~0xFFFULL;
+    uint64_t pa = pa_start & ~0xFFFULL;
+    size_t pages = (size + PAGE_SIZE -1) / PAGE_SIZE;
+
+    for(size_t i = 0; i < pages; i++){
+        mmu_map_page(l0_table, va, pa, flags);
+        va += PAGE_SIZE;
+        pa += PAGE_SIZE;
+    }
+}
+
+void mmu_init(void){
+    l0_root = (uint64_t *)pmm_alloc_page();
+    
+    if(!l0_root){
+        uart_puts("[MMU ERROR] Failed to allocate L0 Root page Table!\n");
+        return;
+    }
+
+    mmu_memzero(l0_root, PAGE_SIZE);
+    
+    //UART MMIO mapping
+    mmu_map_range(l0_root, 0x09000000, 0x09000000, 0x10000, MMU_FLAG_DEVICE);
+    
+    ////GICv2 mapping
+    mmu_map_range(l0_root, 0x08000000, 0x08000000, 0x20000, MMU_FLAG_DEVICE);
+
+    //kernel ram EL1 only 
+    mmu_map_range(l0_root, RAM_START, RAM_START, RAM_SIZE, MMU_FLAG_RAM);
+
+    //user image
+    extern char __user_text_start[];
+    extern char __user_text_end[];
+    
+    extern char __user_rodata_start[];
+    extern char __user_rodata_end[];
+    
+    extern char __user_data_start[];
+    extern char __user_data_end[];
+    
+    uint64_t user_text_start = (uint64_t)__user_text_start;
+    uint64_t user_text_size = (uint64_t)__user_text_end - user_text_start;
+
+    if(user_text_size){
+        //user code
+        mmu_map_range(l0_root, user_text_start, user_text_start,user_text_size, MMU_FLAG_USER_CODE);   
+    }
+
+    
+
+
+    uint64_t user_rodata_start = (uint64_t)__user_rodata_start;
+    uint64_t user_rodata_size = (uint64_t)__user_rodata_end - user_rodata_start;    
+
+   if(user_rodata_size){
+        //user RO data
+        mmu_map_range(l0_root,user_rodata_start, user_rodata_start, user_rodata_size, MMU_FLAG_USER_RODATA);
+    }
+
+    uint64_t user_data_start = (uint64_t)__user_data_start;
+    uint64_t user_data_size = (uint64_t)__user_data_end - user_data_start;    
+
+   if(user_data_size){
+        //user RO data
+        mmu_map_range(l0_root,user_data_start, user_data_start, user_data_size, MMU_FLAG_USER_DATA);
+    }
+
+
+
+
+    uart_puts("[MMU] Before enable\n");
+    //set system register and run mmu
+    arm64_mmu_enable((uint64_t)l0_root);
+
+    uart_puts("[MMU] After enable\n");
+    
+}-e 
+
+
+=== ./mmu/mmu.h ===
+#ifndef MMU_H
+#define MMU_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+#include "memory_layout.h"
+
+#define PAGE_SHIFT      12
+#define TABLE_ENTRIES   512
+#define VA_MASK_9BIT    0x1FF //0b 0001 1111 1111
+
+//macro to extract page table index from VA
+#define L0_INDEX(va)    (((va) >> 39) & VA_MASK_9BIT)
+#define L1_INDEX(va)    (((va) >> 30) & VA_MASK_9BIT)
+#define L2_INDEX(va)    (((va) >> 21) & VA_MASK_9BIT)
+#define L3_INDEX(va)    (((va) >> 12) & VA_MASK_9BIT)
+
+#define MMU_DESCRIPTOR_TABLE    0x3ULL //table descriptor
+#define MMU_DESCRIPTOR_PAGE     0x3ULL //valid 4KB page
+
+
+#define MMU_ATTR_DEVICE_INDEX   (0ULL << 2) //Attr 0(Device - nGnRnE)
+#define MMU_ATTR_NORMAL_INDEX   (1ULL << 2) //Attr 1(Normal Cachable)
+#define MMU_ACCESS_FLAG         (1ULL << 10) //bit[10] = 1
+#define MMU_SH_INNER_SHAREABLE  (3ULL << 8) //bit[9:8] = 0b11
+
+#define MMU_AP_KERNEL_RW        (0ULL << 6) //bit[7:6] = 0b00 (EL1 RW / EL0 None)
+#define MMU_AP_USER_RW          (1ULL << 6) //bit[7:6] = 0b01 (EL1 RW / EL0 RW)
+#define MMU_AP_USER_RO          (3ULL << 6) //bit[7:6] = 0b11 (EL1 RO / EL0 RO)
+
+#define MMU_UXN                 (1ULL <<54)
+#define MMU_PXN                 (1ULL <<53)
+
+#define MMU_FLAG_RAM            (MMU_DESCRIPTOR_PAGE | MMU_ATTR_NORMAL_INDEX | \
+                                MMU_ACCESS_FLAG | MMU_SH_INNER_SHAREABLE | MMU_AP_KERNEL_RW)
+
+
+#define MMU_FLAG_USER_CODE      (MMU_DESCRIPTOR_PAGE | MMU_ATTR_NORMAL_INDEX | \
+                                MMU_ACCESS_FLAG | MMU_SH_INNER_SHAREABLE | MMU_AP_USER_RO)
+
+#define MMU_FLAG_USER_RODATA    (MMU_DESCRIPTOR_PAGE | MMU_ATTR_NORMAL_INDEX | \
+                                MMU_ACCESS_FLAG | MMU_SH_INNER_SHAREABLE | MMU_AP_USER_RO | MMU_UXN | MMU_PXN)
+
+
+
+#define MMU_FLAG_USER_DATA    (MMU_DESCRIPTOR_PAGE | MMU_ATTR_NORMAL_INDEX | \
+                                MMU_ACCESS_FLAG | MMU_SH_INNER_SHAREABLE | MMU_AP_USER_RW | MMU_UXN | MMU_PXN)
+
+
+#define MMU_FLAG_DEVICE         (MMU_DESCRIPTOR_PAGE | MMU_ATTR_DEVICE_INDEX | \
+                                MMU_ACCESS_FLAG | MMU_AP_KERNEL_RW | MMU_UXN | MMU_PXN)
+
+
+
+
+
+void mmu_init(void);
+
+void mmu_map_page(uint64_t *l0_table, uint64_t va, uint64_t pa, uint64_t flags);
+void mmu_map_range(uint64_t *l0_table, uint64_t va_start, uint64_t pa_start, size_t size, uint64_t flags);
+
+uint64_t *mmu_get_root_table(void);
+uint64_t mmu_translate(uint64_t *l0_table, uint64_t va);
+void mmu_tlb_flush(void);
+
+extern void arm64_mmu_enable(uint64_t l0_root);
+
+#endif-e 
+
+
+=== ./mmu/mmu_enable.s ===
+.section ".text"
+.global arm64_mmu_enable
+
+// void arm64_mmu_enable(uint64_t l0_table_pa);
+// x0 is the physical addr of the L0 table
+arm64_mmu_enable:
+    //set MAIR_EL1
+    //Attr 0 (bits[7:0]) = 0x00(device-nGnRnE)
+    //Attr 1 (bits[15:8]) = 0xFF(normal cachable)
+    ldr x1, =0x000000000000FF00
+    msr mair_el1, x1
+
+    //set TCR_EL1
+    // T0SZ = 16 (48-bit Virtual Address, Bits[5:0])
+    // IRGN0 = 0b01 (Inner WB-WA, Bits[9:8])
+    // ORGN0 = 0b01 (Outer WB-WA, Bits[11:10])
+    // SH0 = 0b11 (Inner Shareable, Bits[13:12])
+    // TG0 = 0b00 (4KB Granule, Bits[15:14])
+    // EPD1 = 1 (Disable TTBR1 walks for now, Bit 23)
+    // IPS = 0b010 (40-bit Physical Address space 1TB, Bits[34:32])
+    //ldr x2, =   ((16ULL << 0) | (1ULL << 8)  | (1ULL << 10) | (3ULL << 12) | (0ULL << 14) | (1ULL << 23) | (2ULL << 32))
+    ldr x2, =0x0000000280153510
+    msr tcr_el1, x2
+    isb
+
+
+    //set L0 root table addr in TTBR0_EL1 
+    msr ttbr0_el1, x0
+    isb
+
+    //invalid all tlb entries
+    dsb ish
+    tlbi vmalle1
+    dsb ish
+    isb
+
+    //modify SCTLR_EL1 to enable mmu, data cache, instruction cache
+    mrs x3, sctlr_el1
+    orr x3, x3, #(1 << 0)   //Bit 0 : MMU enable
+    bic x3, x3, #(1 << 2)   //Bit 2 : Data cache enable
+    bic x3, x3, #(1 << 12)  //Bit 12: Instruction cache enable
+    bic x3, x3, #(1 << 19) //Disable WXN
+    msr sctlr_el1, x3
+    isb
+
+    ret
+    
+
+
+-e 
+
+
+=== ./boot/vector.s ===
+.section ".text.vector"
+
+.macro ventry label
+    .align 7 //128bytes
+    b \label
+.endm
+
+.macro kernel_entry
+    sub sp, sp, #272
+    stp x0, x1, [sp, #16 * 0]
+    stp x2, x3, [sp, #16 * 1]
+    stp x4, x5, [sp, #16 * 2]
+    stp x6, x7, [sp, #16 * 3]
+    stp x8, x9, [sp, #16 * 4]
+    stp x10, x11, [sp, #16 * 5]
+    stp x12, x13, [sp, #16 * 6]
+    stp x14, x15, [sp, #16 * 7]
+    stp x16, x17, [sp, #16 * 8]
+    stp x18, x19, [sp, #16 * 9]
+    stp x20, x21, [sp, #16 * 10]
+    stp x22, x23, [sp, #16 * 11]
+    stp x24, x25, [sp, #16 * 12]
+    stp x26, x27, [sp, #16 * 13]
+    stp x28, x29, [sp, #16 * 14]
+
+    mrs x21, elr_el1
+    mrs x22, spsr_el1
+
+    stp x30, x21, [sp, #16 * 15]
+    str x22, [sp, #16 * 16]
+.endm
+
+.macro kernel_exit
+    ldr x22, [sp, #16 * 16]
+    ldp x30, x21, [sp, #16 * 15]
+    msr spsr_el1, x22
+    msr elr_el1, x21
+    
+    ldp x28, x29, [sp, #16 * 14]
+    ldp x26, x27, [sp, #16 * 13]
+    ldp x24, x25, [sp, #16 * 12]
+    ldp x22, x23, [sp, #16 * 11]
+    ldp x20, x21, [sp, #16 * 10]
+    ldp x18, x19, [sp, #16 * 9]
+    ldp x16, x17, [sp, #16 * 8]
+    ldp x12, x13, [sp, #16 * 6]
+    ldp x14, x15, [sp, #16 * 7]
+    ldp x10, x11, [sp, #16 * 5]
+    ldp x8, x9, [sp, #16 * 4]
+    ldp x6, x7, [sp, #16 * 3]
+    ldp x4, x5, [sp, #16 * 2]
+    ldp x2, x3, [sp, #16 * 1]
+    ldp x0, x1, [sp, #16 * 0]
+    
+    add sp, sp, #272
+    
+    eret
+.endm
+    
+.align 11
+.global exception_vector_table
+exception_vector_table:
+    // 1. current EL with SP0
+    ventry sync_invalid_el1t
+    ventry irq_invalid_el1t
+    ventry fiq_invalid_el1t
+    ventry serror_invalid_el1t
+
+    // 2. current EL with SPx
+    ventry el1_sync_entry // to implement, suffixed with _entry 
+    ventry el1_irq_entry  // to implement, suffixed with _entry
+    ventry fiq_invalid_el1h
+    ventry serror_invalid_el1h
+
+    // 3. current EL with AArch64
+    ventry lower_sync_entry //to implement, suffixed with _entry
+    ventry lower_irq_entry //to implement, suffixed with _entry
+    ventry fiq_invalid_lower
+    ventry serror_invalid_lower
+
+    // 4. current EL with AArch32
+    ventry sync_invalid_aarch32
+    ventry irq_invalid_aarch32
+    ventry fiq_invalid_aarch32
+    ventry serror_invalid_aarch32
+
+el1_sync_entry:
+    kernel_entry
+    mov x0, sp
+    mrs x1, esr_el1
+    mrs x2, far_el1
+    bl  handle_el1_sync
+    kernel_exit
+
+el1_irq_entry:
+    kernel_entry
+    bl  handle_el1_irq
+    kernel_exit
+
+lower_sync_entry:
+    kernel_entry
+    mov x0, sp
+    mrs x1, esr_el1
+    mrs x2, far_el1
+    bl handle_lower_sync
+    kernel_exit
+
+lower_irq_entry:
+    kernel_entry
+    bl handle_lower_irq
+    kernel_exit
+
+sync_invalid_el1t:
+irq_invalid_el1t:
+fiq_invalid_el1t:
+serror_invalid_el1t:
+fiq_invalid_el1h:
+serror_invalid_el1h:
+fiq_invalid_lower:
+serror_invalid_lower:
+sync_invalid_aarch32:
+irq_invalid_aarch32:
+fiq_invalid_aarch32:
+serror_invalid_aarch32:
+    kernel_entry
+    mov x0, sp
+    mrs x1, esr_el1
+    mrs x2, far_el1
+    bl handle_unknown_exception
+1:  wfe
+    b 1b
+
+
+
+-e 
+
+
+=== ./boot/boot.s ===
+.section ".text.boot"
+.global _start
+
+_start:
+	mrs x0, mpidr_el1
+	and x0, x0, #0xFF
+	cbz x0, el_setup
+
+hang:
+	wfe
+	b hang
+
+el_setup:
+	mrs x0, CurrentEL
+	lsr x0, x0, #2
+
+	cmp x0, #3
+	b.eq level_el3
+	cmp x0, #2
+	b.eq level_el2
+	b init_kernel_sp
+	
+level_el3:
+	ldr x1, =0x401
+	msr scr_el3, x1
+
+	mov x1, #0b00101
+	msr spsr_el3, x1
+	
+	adr x1, init_kernel_sp
+	msr elr_el3, x1
+	
+	eret
+
+level_el2:
+	ldr x1, =0x80000000
+	msr hcr_el2, x1
+
+	mov x1, #0b00101
+	msr spsr_el2, x1
+	
+	adr x1, init_kernel_sp
+	msr elr_el2, x1
+	
+	eret
+
+init_kernel_sp:
+	mov x0, #(3<<20) // fcu/neon disable		
+	msr cpacr_el1, x0
+	isb
+
+	ldr x0, = __stack_top
+	mov sp, x0
+
+	ldr x1, = __bss_start
+	ldr x2, = __bss_end
+
+clear_bss:
+	cmp x1, x2
+	b.ge enter_kernel
+	str xzr, [x1], #8
+	b clear_bss
+
+enter_kernel:
+	bl kernel_main
+system_halt:
+	wfi
+	b system_halt
+	-e 
+
+
+=== ./timer/timer.c ===
+#include "timer.h"
+#include "gic.h"
+#include "uart.h"
+
+static volatile uint64_t timer_ticks = 0;
+static uint64_t timer_interval = 0;
+
+static inline uint64_t read_cntfrq(void){
+    uint64_t val;
+    asm volatile("mrs %0, cntfrq_el0" : "=r"(val));
+    return val;
+}
+static inline void write_cntpfrq(uint64_t val){
+    asm volatile("msr cntfrq_el0, %0" : : "r"(val));
+}
+
+static inline void write_cntp_tval(uint64_t val){
+    asm volatile("msr cntp_tval_el0, %0" : : "r"(val) : "memory");
+}
+
+static inline uint64_t read_cntp_tval(void){
+    uint64_t val;
+    asm volatile("mrs %0, cntp_tval_el0" : "=r"(val));
+    return val;
+}
+
+static inline void write_cntp_ctl(uint64_t val){
+    asm volatile("msr cntp_ctl_el0, %0" : : "r"(val) : "memory");
+}
+
+static inline uint64_t read_cntp_ctl(void){
+    uint64_t val;
+    asm volatile("mrs %0, cntp_ctl_el0" : "=r"(val));
+    return val;
+}
+
+void timer_init(uint32_t target_hz){
+    if(target_hz == 0) target_hz = 100; //default = 100Hz(10ms)
+    
+    //Read the CPU physical timer frequency
+    uint64_t freq = read_cntfrq(); 
+
+    if (freq == 0){
+        freq = 62500000ULL;
+        write_cntpfrq(freq);
+    }
+    //Calculate the countdown value for a single interrupt
+    timer_interval = freq / target_hz;
+
+    //In GICv2 enable Num 30 Timer Interrupt
+    gic_enable_interrupt(IRQ_TIMER_PHYS_NS);
+
+    write_cntp_tval(timer_interval);
+    write_cntp_ctl(1);
+}
+
+void timer_handle_irq(void){
+    //if you wanna test it, uncomment the uart code below
+    //uart_puts("[TIMER IRQ] ENTER\n");
+    //uart_puts("[TIMER IRQ] ticks = ");
+    //uart_put_hex(timer_ticks);
+    //uart_puts("\n");
+
+    timer_ticks++;
+    //Reload the countdown timer for the next period
+    write_cntp_tval(timer_interval);
+}
+
+uint64_t timer_get_ticks(void){
+    return timer_ticks;
+}
+
+void timer_sleep_ticks(uint64_t count){
+    uint64_t start = timer_ticks;
+    while(timer_ticks - start < count){
+        asm volatile ("wfi"); // Wait for an interrupt 
+    }
+}
+
+
+
+
+-e 
+
+
+=== ./timer/timer.h ===
+#ifndef TIMER_H
+#define TIMER_H
+
+#include <stdint.h>
+
+void timer_init(uint32_t target_hz);
+void timer_handle_irq(void);
+uint64_t timer_get_ticks(void);
+void timer_sleep_ticks(uint64_t count);
+
+
+
+#endif-e 
+
+
+=== ./sched/switch.s ===
+.section ".text"
+.global cpu_switch_to
+.global task_entry_trampoline
+.global user_first_return
+
+// void cpu_switch_to(task_struct_t *prev, task_struct_t *next);
+// x0, prev task(context offset: 0) 
+// x1 = nexts task(context offset: 0)
+
+cpu_switch_to:
+    //prev task callee register backup and store
+    mov x2, sp
+    stp x19,x20, [x0, #16 * 0]
+    stp x21,x22, [x0, #16 * 1]
+    stp x23,x24, [x0, #16 * 2]
+    stp x25,x26, [x0, #16 * 3]
+    stp x27,x28, [x0, #16 * 4]
+    stp x29,x30, [x0, #16 * 5]
+
+    str x2,      [x0, #16 * 6]
+    
+    //next task callee register and restore
+    ldp x19,x20, [x1, #16 * 0]
+    ldp x21,x22, [x1, #16 * 1]
+    ldp x23,x24, [x1, #16 * 2]
+    ldp x25,x26, [x1, #16 * 3]
+    ldp x27,x28, [x1, #16 * 4]
+    ldp x29,x30, [x1, #16 * 5]
+
+    ldr x2,      [x1, #16 * 6]
+    mov sp, x2
+
+    //user_sp offset = 104
+    ldr x3, [x1, #104]
+
+    msr sp_el0, x3
+    
+    isb
+
+    ret
+    
+task_entry_trampoline:
+
+    msr daifclr, #2
+    isb
+    //Task function call(in x19)
+    blr x19
+    //Function exit, task clean routine
+    bl task_exit
+
+1:
+    wfe
+    b 1b
+
+user_first_return:
+    ldr x22, [sp, #248]
+    ldr x21, [sp, #256]
+
+    msr elr_el1, x22
+    msr spsr_el1, x21
+
+    ldp x0,x1, [sp, #16 * 0]
+    ldp x2,x3, [sp, #16 * 1]
+    ldp x4,x5, [sp, #16 * 2]
+    ldp x6,x7, [sp, #16 * 3]
+    ldp x8,x9, [sp, #16 * 4]
+    ldp x10,x11, [sp, #16 * 5]
+    ldp x12,x13, [sp, #16 * 6]
+    ldp x14,x15, [sp, #16 * 7]
+    ldp x16,x17, [sp, #16 * 8]
+    ldp x18,x19, [sp, #16 * 9]
+    ldp x20,x21, [sp, #16 * 10]
+    ldp x22,x23, [sp, #16 * 11]
+    ldp x24,x25, [sp, #16 * 12]
+    ldp x26,x27, [sp, #16 * 13]
+    ldp x28,x29, [sp, #16 * 14]
+
+    ldr x30, [sp, #16 * 15]
+    add sp, sp, #272
+
+
+    eret-e 
+
+
+=== ./sched/sched.h ===
+#ifndef SCHED_H
+#define SCHED_H
+
+#include "task.h"
+
+void sched_init(uint64_t initial_sp);
+
+task_struct_t *task_create(void(*entry_fn)(void));
+task_struct_t *task_create_user(void(*entry_fn)(void));
+
+void schedule(void);
+void sched_tick(void);
+void task_exit(void);
+
+task_struct_t *sched_get_current_task(void);
+uint32_t sched_get_live_user_tasks(void);
+
+extern void cpu_switch_to(task_struct_t *prev, task_struct_t*next);
+extern void task_entry_trampoline(void);
+extern void user_first_return(void);
+
+#endif-e 
+
+
+=== ./sched/sched.c ===
+#include "sched.h"
+#include "pmm.h"
+#include "heap.h"
+#include "uart.h"
+#include "mmu.h"
+#include "exception.h"
+
+static task_struct_t *current_task = 0;
+static task_struct_t *task_list_head = 0;
+
+static uint32_t next_pid = 0;
+static uint32_t user_stack_slot = 0;
+
+void sched_init(uint64_t initial_sp){
+    //Register the main kernel running immediately after boot as PID 0
+    task_struct_t *idle_task = (task_struct_t *)kmalloc(sizeof(task_struct_t));
+    if(!idle_task){
+        uart_puts("[SCHED ERROR] Failed to allocate Idle Task TCB!\n");
+        return;
+    }
+
+    idle_task->pid = next_pid++;
+    idle_task->state = TASK_RUNNING;
+    idle_task->time_slice = DEFAULT_TIME_SLICE;
+    idle_task->sleep_ticks = 0;
+
+    idle_task->stack_base = 0;//use main kernel
+    idle_task->user_stack_base = 0;
+    idle_task->user_stack_top = 0;
+
+    idle_task->entry_fn = 0;
+    
+    idle_task->is_user = 0;
+    
+    idle_task->context.x19 = 0;
+    idle_task->context.x20 = 0;
+    idle_task->context.x21 = 0;
+    idle_task->context.x22 = 0;
+    idle_task->context.x23 = 0;
+    idle_task->context.x24 = 0;
+    idle_task->context.x25 = 0;
+    idle_task->context.x26 = 0;
+    idle_task->context.x27 = 0;
+    idle_task->context.fp = 0;
+    idle_task->context.lr = 0;
+    idle_task->context.sp = initial_sp;
+    idle_task->context.user_sp = 0;
+    
+    idle_task->next = idle_task;//Single task circular scheduling
+
+    current_task = idle_task;
+    task_list_head = idle_task;
+
+    uart_puts("[SCHED] Schedular Initialized (Idle Task PID 0 Activate)\n");
+}
+
+task_struct_t *task_create(void (*entry_fn)(void)){
+    if(!entry_fn) return 0;
+
+    //Dynamic allocate TCB struct
+    task_struct_t *new_task = (task_struct_t*)kmalloc(sizeof(task_struct_t));
+    if(!new_task) return 0;
+
+    //Allocation one page(4KB) of physical memmory for the task's private stack
+    void *stack = pmm_alloc_page();
+    if(!stack){
+        kfree(new_task);
+        return 0;
+    }
+
+    new_task->pid = next_pid++;
+    new_task->state = TASK_READY;
+    new_task->time_slice = DEFAULT_TIME_SLICE;
+    new_task->sleep_ticks = 0;
+
+    new_task->stack_base = stack;
+    new_task->user_stack_base = 0;
+    new_task->user_stack_top = 0;
+    
+    new_task->entry_fn = entry_fn;
+    
+    new_task->is_user = 0;
+
+    //Calculate the stack top
+    uint64_t stack_top = ((uint64_t)stack + TASK_STACK_SIZE) & ~0xFULL;
+
+    //Initialize CPU Context
+    new_task->context.x19 = (uint64_t)entry_fn;
+    new_task->context.x20 = 0;
+    
+    new_task->context.lr = (uint64_t)task_entry_trampoline;
+    new_task->context.sp = stack_top;
+
+    new_task->context.user_sp = 0;
+
+    new_task->context.fp = 0;
+
+    //Insert into circular linked list
+    new_task->next = task_list_head->next;
+    task_list_head->next = new_task;
+
+    return new_task;
+}
+
+
+task_struct_t *task_create_user(void (*entry_fn)(void)){
+    if(!entry_fn) return 0;
+
+    uint64_t entry = (uint64_t)entry_fn;
+
+    if(entry < USER_START || entry >= USER_END){
+        uart_puts("[SCHED ERROR] User entry is outside user address space!\n");
+        return 0;
+    }
+
+    task_struct_t *new_task = (task_struct_t*)kmalloc(sizeof(task_struct_t));
+    if(!new_task) return 0;
+
+    //Allocation Kernel page(4KB) and User page(4KB) of physical memmory
+    void *kstack = pmm_alloc_page();
+    void *ustack = pmm_alloc_page();
+    if(!kstack || !ustack){
+        if(kstack)pmm_free_page(kstack);
+        if(ustack)pmm_free_page(ustack);
+        
+        kfree(new_task);
+        return 0;
+    }
+
+    uint64_t user_stack_va = USER_STACK_TOP - ((user_stack_slot + 1) * PAGE_SIZE);
+    uint64_t user_stack_top = user_stack_va + PAGE_SIZE;
+
+    user_stack_slot++;
+    
+
+
+    uint64_t *root = mmu_get_root_table();
+
+    mmu_map_page(root, user_stack_va, (uint64_t)ustack, MMU_FLAG_USER_DATA);
+
+    mmu_tlb_flush();
+
+
+    uint64_t kstack_top = ((uint64_t)kstack + TASK_STACK_SIZE) & ~0xFULL;
+   
+    trap_frame_t *tf = (trap_frame_t *)(kstack_top - sizeof(trap_frame_t));
+
+    uint64_t *raw = (uint64_t *)tf;
+
+    for(size_t i=0; i < sizeof(trap_frame_t)/sizeof(uint64_t); i++){
+        raw[i]=0;
+    }
+
+    //Initial ELR
+    tf->elr_el1 = entry;
+
+    tf->spsr_el1 = 0;
+
+
+    new_task->pid = next_pid++;
+    new_task->state = TASK_READY;
+    new_task->time_slice = DEFAULT_TIME_SLICE;
+    new_task->sleep_ticks = 0;
+    new_task->stack_base = kstack;
+    new_task->user_stack_base = ustack;
+    new_task->user_stack_top = user_stack_top;
+    new_task->entry_fn = entry_fn;
+    new_task->is_user = 1;
+
+
+    //Initialize CPU Context
+    new_task->context.x19 = 0;
+    new_task->context.x20 = 0;
+    new_task->context.x21 = 0;
+    new_task->context.x22 = 0;
+    new_task->context.x23 = 0;
+    new_task->context.x24 = 0;
+    new_task->context.x25 = 0;
+    new_task->context.x26 = 0;
+    new_task->context.x27 = 0;
+    new_task->context.fp = 0;
+
+    new_task->context.lr = (uint64_t)user_first_return;
+    new_task->context.sp = (uint64_t)tf;
+    new_task->context.user_sp = user_stack_top;
+
+    new_task->next = task_list_head->next;
+    task_list_head->next = new_task;
+
+
+    uart_puts("[USER] User task created\n ");
+    
+
+    uart_puts("[USER] entry = ");
+    uart_put_hex(entry);
+    uart_puts("\n");
+
+    uart_puts("[USER] kstack = ");
+    uart_put_hex((uint64_t)kstack);
+    uart_puts("\n");
+
+    uart_puts("[USER] ustack PA  = ");
+    uart_put_hex((uint64_t)ustack);
+    uart_puts("\n");
+
+    uart_puts("[USER] ustack VA  = ");
+    uart_put_hex((uint64_t)ustack);
+    uart_puts("\n");
+
+
+    uart_puts("[USER] ustack top  = ");
+    uart_put_hex(user_stack_top);
+    uart_puts("\n");
+
+    return new_task;
+}
+
+void schedule(void){
+    if(!current_task || !task_list_head) return;
+
+    task_struct_t *prev = current_task;
+    task_struct_t *next = prev->next;
+
+    //Find the next runnable task in the READY state
+    do
+    {
+        if(next->state == TASK_READY || next->state == TASK_RUNNING){
+            break;
+        }
+        next = next->next;
+    }while (next != prev);
+
+    if(next == prev){
+        if(prev->state == TASK_RUNNING)
+            return;
+        return;
+    } 
+
+
+    if(prev->state == TASK_RUNNING){
+        prev->state = TASK_READY;
+    }
+    next->state = TASK_RUNNING;
+    next->time_slice = DEFAULT_TIME_SLICE;
+
+    current_task = next;
+
+    cpu_switch_to(prev, next);
+}
+
+void sched_tick(void){
+    if(!current_task || !task_list_head) return;
+
+    task_struct_t *task = task_list_head;
+
+    do{
+        if(task->state == TASK_BLOCKED && task->sleep_ticks > 0){
+            task->sleep_ticks--;
+            if(task->sleep_ticks == 0)
+                task->state = TASK_READY;
+        }
+        
+        task = task->next;
+    }while (task!=task_list_head);
+    
+
+    if(current_task->state != TASK_RUNNING){
+        schedule();
+        return;
+    }
+    
+    if(current_task->time_slice > 0)
+        current_task->time_slice--;
+
+    if(current_task->time_slice == 0){
+        schedule();
+    }
+}
+
+void task_exit(void){
+    task_struct_t *exiting = current_task;
+
+    if(!exiting)
+        return;
+
+    exiting ->state = TASK_TERMINATED;
+    exiting ->sleep_ticks = 0;
+    exiting ->time_slice = 0;
+
+    schedule();
+
+    asm volatile("msr daifset, #2" ::: "memory");
+
+    while(1){
+        asm volatile("wfe");
+    }
+}
+
+task_struct_t *sched_get_current_task(void){
+    return current_task;
+}
+
+uint32_t sched_get_live_user_tasks(void){
+    if(!task_list_head)
+        return 0;
+
+    uint32_t count = 0;
+    task_struct_t *curr = task_list_head;
+
+    do{
+        if(curr->is_user && curr->state != TASK_TERMINATED)
+            count++;
+        curr = curr->next;            
+    }while(curr != task_list_head);
+
+    return count;
+}-e 
+
+
+=== ./sched/task.h ===
+#ifndef TASK_H
+#define TASK_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+#include "memory_layout.h"
+#include "vfs.h"
+
+#define TASK_STACK_SIZE         4096//Each Task size
+#define DEFAULT_TIME_SLICE      5   //Default 50ms
+#define MAX_FD 16
+
+//ARM64 Callee Saved Register
+typedef struct cpu_context
+{
+    uint64_t x19;
+    uint64_t x20;
+    uint64_t x21;
+    uint64_t x22;
+    uint64_t x23;
+    uint64_t x24;
+    uint64_t x25;
+    uint64_t x26;
+    uint64_t x27;
+    uint64_t x28;
+    uint64_t fp;    //x29
+    uint64_t lr;    //x39
+    uint64_t sp;    //Stack Pointer
+
+
+    uint64_t user_sp;
+
+}cpu_context_t;
+
+typedef enum task_state{
+    TASK_READY = 0,
+    TASK_RUNNING,
+    TASK_BLOCKED,
+    TASK_TERMINATED
+}task_state_t;
+
+//Task Control Block(TCB)
+typedef struct task_struct
+{
+    cpu_context_t context;      //offset 0
+    uint32_t pid;
+    task_state_t state;
+    uint32_t time_slice;        //remain ruuning ticks
+    uint32_t sleep_ticks;       //sys_sleep waiting tick
+
+    void *stack_base;           //stack start physical addr
+    void *user_stack_base;      //user stack (EL0)
+
+    file_t *fd_table[MAX_FD];
+    
+    uint64_t user_stack_top;    //user stack VA
+    
+    void (*entry_fn)(void);     //task 
+
+    uint8_t is_user;            //1 = EL0 Task, 0 = Kernel Task
+
+    struct task_struct *next;   //run queue linked list pointer
+}task_struct_t;
+
+#endif-e 
+
+
+=== ./Makefile ===
+CROSS_COMPILE ?= aarch64-linux-gnu-
+CC		:= $(CROSS_COMPILE)gcc
+AS		:= $(CROSS_COMPILE)gcc
+LD		:= $(CROSS_COMPILE)ld
+
+QEMU	:= qemu-system-aarch64
+QFLAGS	:= -M virt,gic-version=2 -cpu cortex-a53 -nographic -serial mon:stdio
+
+CFLAGS	:= -g -Wall -Wextra -O3 -ffreestanding -nostdlib -nostartfiles -mgeneral-regs-only \
+			-Iuart -Ikernel -Itest -Ipmm -Iheap -Immu -Igic -Itimer -Isched -Isyscall
+ASFLAGS	:= -Wall -ffreestanding -nostdlib
+LDFLAGS	:= -T linker.ld -nostdlib --no-warn-rwx-segments
+
+ifeq ($(TEST), 1)
+	CFLAGS += -DENABLE_TESTS
+endif
+
+
+BUILD_DIR	:= build
+TARGET_ELF	:= $(BUILD_DIR)/kernel.elf
+
+SRCS_C	:= kernel/kernel.c kernel/exception.c uart/uart.c pmm/pmm.c heap/heap.c mmu/mmu.c gic/gic.c timer/timer.c sched/sched.c syscall/syscall.c \
+			vfs/vfs.c vfs/devfs.c vfs/ramfs.c \
+			test/test_exception.c test/test_pmm.c test/test_heap.c test/test_mmu.c test/test_timer.c test/test_sched.c test/test_user.c 
+SRCS_S	:= boot/boot.s boot/vector.s mmu/mmu_enable.s sched/switch.s
+
+OBJS	:= 	$(patsubst %.c, $(BUILD_DIR)/%.o, $(SRCS_C)) \
+			$(patsubst %.s, $(BUILD_DIR)/%.o, $(SRCS_S))
+
+.PHONY: all run debug test clean
+
+all: $(TARGET_ELF)
+
+$(TARGET_ELF): $(OBJS) linker.ld
+		@mkdir -p $(dir $@)
+		$(LD) $(LDFLAGS) -o $@ $(OBJS)
+
+$(BUILD_DIR)/%.o: %.c
+		@mkdir -p $(dir $@)
+		$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/%.o: %.s
+		@mkdir -p $(dir $@)
+		$(AS) $(ASFLAGS) -c $< -o $@
+
+run: $(TARGET_ELF)
+		$(QEMU) $(QFLAGS) -kernel $(TARGET_ELF)
+
+debug: $(TARGET_ELF)
+		$(QEMU) $(QFLAGS) -kernel $(TARGET_ELF) -s -S
+
+test: 
+		@$(MAKE) clean
+		@$(MAKE) run TEST=1
+
+clean:
+		rm -rf $(BUILD_DIR)
+-e 
+
+
+=== ./syscall/syscall.c ===
+#include "syscall.h"
+#include "sched.h"
+#include "uart.h"
+#include "task.h"
+#include "vfs.h"
+
+static int user_range_valid(uint64_t ptr, uint64_t size){
+    if(size == 0)
+        return 1;
+    if(ptr < USER_START)
+        return 0;
+    if(ptr >= USER_END)
+        return 0;
+    
+    if(size > USER_END - ptr)
+        return 0;
+
+    return 1;
+}
+
+
+// 0: sys_yield
+static int64_t ksys_yield(void){
+    schedule();
+    return 0;
+}
+
+// 1: sys_write
+static int64_t ksys_write(int fd, const char *buf, size_t count){
+    if(fd != 1 && fd !=2) return -1; //support only stdout/stderr
+    if(!buf) return -1;
+
+    if(count > 4096)
+        return -1;
+
+    if(!user_range_valid((uint64_t)buf, count))
+        return -1;
+
+    for(size_t i = 0; i < count; i++){
+        uart_putc(buf[i]);
+    }
+    return (int64_t)count;
+}
+
+// 2: sys_getpid
+static int64_t ksys_getpid(void){
+    task_struct_t *curr = sched_get_current_task();
+    return curr ? (int64_t)curr->pid : -1;
+}
+
+// 3: sys_sleep
+static int64_t ksys_sleep(uint64_t ticks){
+    task_struct_t *curr = sched_get_current_task();
+    if(!curr) return -1;
+
+    if(ticks == 0){
+        schedule();
+        return 0;
+    }
+
+    curr->sleep_ticks = ticks;
+    curr->state = TASK_BLOCKED;
+
+    schedule();
+    
+    return 0;
+}
+
+// 4: sys_exit
+static int64_t ksys_exit(int code){
+    (void)code;
+    task_exit();
+    return 0;
+}
+
+//syscall pointer table
+static void *syscall_table[MAX_SYSCALL];
+
+void syscall_init(void){
+    syscall_table[SYS_YIELD] = (void *)ksys_yield;
+    syscall_table[SYS_WRITE] = (void *)ksys_write;
+    syscall_table[SYS_GETPID] = (void *)ksys_getpid;
+    syscall_table[SYS_SLEEP] = (void *)ksys_sleep;
+    syscall_table[SYS_EXIT] = (void *)ksys_exit;
+
+    uart_puts("[SYSCALL] System Call Table Initialized (5 Call Vectors Registerd)\n");
+}
+
+void syscall_dispatch(trap_frame_t *tf){
+    uint64_t syscall_num = tf->x[8]; //AArch64 ABI
+
+    task_struct_t *current = sched_get_current_task();
+
+    if(syscall_num >= MAX_SYSCALL || !syscall_table[syscall_num]){
+        uart_puts("[SYSCALL ERROR] Unknown Syscall Invoked: ");
+        uart_put_hex(syscall_num);
+        uart_puts("\n");
+
+        tf->x[0] = (uint64_t)-1; // -ENOSYS
+        return;
+    }
+
+    //syscall index mapping(x0, x1, x2, x3)
+    uint64_t arg0 = tf->x[0];
+    uint64_t arg1 = tf->x[1];
+    uint64_t arg2 = tf->x[2];
+    
+    switch (syscall_num) {
+        case SYS_YIELD:
+            sched_yield();
+            tf->x[0] = 0;
+            break;
+
+        case SYS_WRITE: {
+            int fd = (int)tf->x[0];
+            const char *buf = (const char *)tf->x[1];
+            size_t count = (size_t)tf->x[2];
+
+            // Standard Output (1) / Standard Error (2) -> Console UART 직접 출력 지원
+            if (fd == 1 || fd == 2) {
+                for (size_t i = 0; i < count; i++) uart_putc(buf[i]);
+                tf->x[0] = count;
+            } else if (fd >= 0 && fd < MAX_FD && current->fd_table[fd]) {
+                tf->x[0] = vfs_write(current->fd_table[fd], buf, count);
+            } else {
+                tf->x[0] = -1; // Invalid FD
+            }
+            break;
+        }
+
+        case SYS_READ: {
+            int fd = (int)tf->x[0];
+            void *buf = (void *)tf->x[1];
+            size_t count = (size_t)tf->x[2];
+
+            if (fd >= 0 && fd < MAX_FD && current->fd_table[fd]) {
+                tf->x[0] = vfs_read(current->fd_table[fd], buf, count);
+            } else {
+                tf->x[0] = -1;
+            }
+            break;
+        }
+
+        case SYS_OPEN: {
+            const char *path = (const char *)tf->x[0];
+            int flags = (int)tf->x[1];
+
+            int free_fd = -1;
+            for (int i = 3; i < MAX_FD; i++) { // 0, 1, 2 표준 입출력 제외 빈 슬롯 검색
+                if (current->fd_table[i] == NULL) {
+                    free_fd = i;
+                    break;
+                }
+            }
+
+            if (free_fd < 0) {
+                tf->x[0] = -1; // Table Full
+                break;
+            }
+
+            file_t *file = vfs_open(path, flags);
+            if (file) {
+                current->fd_table[free_fd] = file;
+                tf->x[0] = free_fd;
+            } else {
+                tf->x[0] = -1;
+            }
+            break;
+        }
+
+        case SYS_CLOSE: {
+            int fd = (int)tf->x[0];
+            if (fd >= 0 && fd < MAX_FD && current->fd_table[fd]) {
+                vfs_close(current->fd_table[fd]);
+                current->fd_table[fd] = NULL;
+                tf->x[0] = 0;
+            } else {
+                tf->x[0] = -1;
+            }
+            break;
+        }
+
+        case SYS_GETPID:
+            tf->x[0] = current->pid;
+            break;
+
+        case SYS_SLEEP:
+            sched_sleep((uint64_t)tf->x[0]);
+            tf->x[0] = 0;
+            break;
+
+        case SYS_EXIT:
+            sched_exit_task((int)tf->x[0]);
+            break;
+
+        default:
+            uart_puts("[SYSCALL] Unknown Syscall Number: ");
+            uart_put_hex(syscall_num);
+            uart_puts("\n");
+            tf->x[0] = -1;
+            break;
+    }
+}
+
+
+-e 
+
+
+=== ./syscall/syscall.h ===
+#ifndef SYSCALL_H
+#define SYSCALL_H
+
+#include <stdint.h>
+#include <stddef.h>
+#include "exception.h"
+
+//syscall number
+#define SYS_YIELD       0
+#define SYS_WRITE       1
+#define SYS_GETPID      2
+#define SYS_SLEEP       3
+#define SYS_EXIT        4
+#define SYS_OPEN        5
+#define SYS_READ        6
+#define SYS_CLOSE       7
+
+void syscall_init(void);
+void syscall_dispatch(trap_frame_t *tf);
+
+static inline int64_t sys_yield(void){
+    register uint64_t x8 asm("x8") = SYS_YIELD;
+    register int64_t  x0 asm("x0");
+    asm volatile("svc #0" : "=r"(x0) : "r"(x8) : "memory");
+    return x0;
+}
+
+static inline int64_t sys_write(int fd, const char *buf, size_t count){
+    register uint64_t x8 asm("x8") = SYS_WRITE;
+    register int64_t  x0 asm("x0") = (int64_t)fd;
+    register uint64_t x1 asm("x1") = (uint64_t)buf;
+    register uint64_t x2 asm("x2") = (uint64_t)count;
+    asm volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2) : "memory");
+    return x0;
+}
+
+static inline int64_t sys_getpid(void){
+    register uint64_t x8 asm("x8") = SYS_GETPID;
+    register int64_t  x0 asm("x0");
+    asm volatile("svc #0" : "=r"(x0) : "r"(x8) : "memory");
+    return x0;
+}
+
+static inline int64_t sys_sleep(uint64_t ticks){
+    register uint64_t x8 asm("x8") = SYS_SLEEP;
+    register int64_t  x0 asm("x0") = (int64_t)ticks;
+    asm volatile("svc #0" : "+r"(x0) : "r"(x8) : "memory");
+    return x0;
+}
+
+static inline void sys_exit(int code){
+    register uint64_t x8 asm("x8") = SYS_EXIT;
+    register int64_t  x0 asm("x0") = (int64_t)code;
+    asm volatile("svc #0" : : "r"(x8), "r"(x0) : "memory");
+    while(1);   
+}
+
+static inline void sys_open(const char *path, int flags){
+    register uint64_t x8 asm("x8") = SYS_EXIT;
+    register uint64_t x0 asm("x0") = (uint64_t)path;
+    register uint64_t x1 asm("x1") = (uint64_t)flags;
+
+    asm volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1) : "memory");
+    return x0;
+}
+
+static inline void sys_read(int fd, void *buf, size_t count){
+    register uint64_t x8 asm("x8") = SYS_READ;
+    register int64_t  x0 asm("x0") = (int64_t)fd;
+    register uint64_t x1 asm("x1") = (uint64_t)buf;
+    register uint64_t x2 asm("x2") = (uint64_t)count;
+
+    asm volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2) : "memory");
+    return x0;
+}
+
+static inline void sys_close(int fd){
+    register uint64_t x8 asm("x8") = SYS_CLOSE;
+    register int64_t  x0 asm("x0") = (uint64_t)fd;
+
+    asm volatile("svc #0" : "+r"(x0) : "r"(x8) : "memory");
+    return x0;
+}
+
+#endif-e 
+
+
+=== ./linker.ld ===
+ENTRY(_start)
+
+SECTIONS
+{
+    . = 0x40000000;
+
+
+    .text.boot : ALIGN(4)
+    {
+        *(.text.boot)
+    }
+    . = ALIGN(2048);
+
+    .text.vector :
+    {
+        *(.text.vector)
+    }
+
+    . = ALIGN(4096);
+    
+    .text :
+    {
+        __kernel_text_start = .;
+        *(.text*)
+        __kernel_text_end = .;
+    }
+
+    . = ALIGN(4096);
+
+
+    .rodata :
+    {
+        __kernel_rodata_start = .;
+        *(.rodata*)
+        __kernel_rodata_end = .;
+    }
+
+    . = ALIGN(4096);
+
+    .data :
+    {
+        __kernel_data_start = .;
+        *(.data*)
+        __kernel_data_end = .;
+    }
+
+    . = ALIGN(16);
+
+    .bss :
+    {
+        __bss_start = .;
+        *(.bss*)
+        *(COMMON)
+        . = ALIGN(16);
+        __bss_end = .;
+    }
+    
+    . = ALIGN(16);
+
+
+    .stack :
+    {
+        __stack_bottom = .;
+        . = . + 0x10000;
+        __stack_top = .;
+    }
+    
+    . = ALIGN(4096);
+    __kernel_end = .;
+
+    . = 0x47000000;
+    
+    .user_text :
+    {
+        
+        . = ALIGN(4096);
+        __user_text_start = .;
+        KEEP(*(.user_text*))
+        . = ALIGN(4096);
+        __user_text_end = .;
+    }
+
+    .user_rodata :
+    {
+        . = ALIGN(4096);
+        __user_rodata_start = .;
+        KEEP(*(.user_rodata*))
+        . = ALIGN(4096);
+        __user_rodata_end = .;
+    }
+
+    .user_data :
+    {
+        . = ALIGN(4096);
+        __user_data_start = .;
+        KEEP(*(.user_data*))
+        . = ALIGN(4096);
+        __user_data_end = .;
+    }
+
+    __user_image_start = __user_text_start;
+    __user_image_end = .;
+}-e 
+
+
+=== ./README.md ===
+# MiniOS
+
+ARM64 기반으로 구현한 교육 목적의 Mini Operating System 프로젝트입니다
+
+본 문서는 MiniOS를 구현하는 과정에서 발생한 주요 결함을 문제 상황 → 디버깅 및 추적 → 근본 원인 → 해결 방법 → 고찰의 흐름으로 기록하기 위한 문서입니다.
+
+---
+
+# 결함 및 디버깅 기록
+
+## 1. GCC 자동 벡터화(-O2)와 CPU FPU/SIMD 하드웨어 트랩 충돌
+
+### 문제 상황
+
+동적 메모리 할당자 `kmalloc` 구현 후 정상적인 RAM 주소를 할당받았음에도, 메모리에 값을 반복적으로 쓰는 순간 커널 패닉이 발생했다.
+
+처음에는 잘못된 포인터나 메모리 정렬 문제에 의한 `Data Abort`를 의심했다.
+
+### 디버깅 및 추적
+
+트랩 프레임을 분석한 결과:
+
+* 접근 주소는 정상적인 RAM 영역
+* 포인터 정렬 역시 정상
+* `FAR_EL1`이 `0x0`
+
+이라는 특이점을 확인했다.
+
+일반적인 메모리 접근 오류라면 Fault Address가 `FAR_EL1`에 기록되어야 한다. 따라서 실제 메모리 주소 문제가 아니라 CPU가 특정 명령어 실행을 Trap한 상황으로 범위를 좁혔다.
+
+`ESR_EL1`의 Exception Class(EC)를 분석한 결과:
+
+```text
+EC = 0x07
+```
+
+이었으며, 이는 Advanced SIMD/Floating Point 접근 Trap임을 확인했다.
+
+### 근본 원인
+
+GCC의 `-O2` 최적화 과정에서 단순한 메모리 쓰기 루프가 ARM64 NEON/SIMD 명령어로 자동 벡터화되었다.
+
+그러나 초기 부팅 상태에서는 CPU의 FPU/SIMD 사용이 허용되지 않아 해당 명령어가 실행될 때 예외가 발생했다.
+
+즉,
+
+```text
+C 코드
+  ↓
+GCC -O2
+  ↓
+NEON/SIMD 명령어로 자동 벡터화
+  ↓
+FPU/SIMD 접근 Trap
+  ↓
+Kernel Exception
+```
+
+의 흐름이었다.
+
+### 해결
+
+EL1 초기화 과정에서 `CPACR_EL1`의 `FPEN` 비트를 `0b11`로 설정하여 FPU/SIMD 접근을 허용하고 `ISB`를 수행했다.
+
+추가적으로 커널 빌드 옵션에:
+
+```text
+-mgeneral-regs-only
+```
+
+를 적용하여 커널 코드가 불필요한 SIMD/FPU 명령어를 생성하지 않도록 제한했다.
+
+### 고찰
+
+최적화는 일반적인 애플리케이션에서는 성능 향상에 도움이 되지만, OS 커널에서는 **컴파일러가 생성하는 명령어까지 하드웨어 초기화 상태와 연결되어 있다는 점**을 확인했다.
+
+특히 인터럽트와 Context Switch를 직접 구현하는 환경에서는 SIMD 레지스터 상태까지 관리해야 하므로, 초기 커널에서는 General Purpose Register 중심으로 실행 범위를 제한하는 것이 안정적이었다.
+
+---
+
+## 2. 힙 관리자 베이스 주소 오염으로 인한 Data Abort
+
+### 문제 상황
+
+힙 초기화 직후 첫 번째 `kmalloc()`은 정상적으로 수행되는 것처럼 보였지만, 반환된 포인터를 역참조하여 데이터를 쓰는 순간 Data Abort가 발생했다.
+
+### 디버깅 및 추적
+
+커널 패닉 덤프에서 메모리 접근에 사용된 레지스터 값이:
+
+```text
+0x0000000000000020
+```
+
+으로 나타났다.
+
+이 값이 힙 블록 메타데이터 구조체인 `block_header_t`의 크기와 정확히 일치한다는 점에 주목하여 `heap_init()`과 `kmalloc()`의 포인터 연산을 역추적했다.
+
+### 근본 원인
+
+`heap_init()`에서 힙의 시작 주소인 `heap_start`에 실제 PMM 할당 주소를 저장해야 했지만, 실수로 **힙 전체 크기를 계산한 값을 포인터 변수에 대입**했다.
+
+그 결과 힙의 시작 주소가 잘못 설정되었고, `kmalloc()`은 잘못된 베이스 주소에 `HEADER_SIZE(0x20)`를 더하여 다음과 같은 주소를 반환하게 되었다.
+
+```text
+잘못된 heap_start
+      ↓
+kmalloc()
+      ↓
+heap_start + HEADER_SIZE
+      ↓
+0x20
+      ↓
+잘못된 주소 역참조
+      ↓
+Data Abort
+```
+
+### 해결
+
+힙 시작 주소를 PMM이 반환한 실제 메모리 주소로 정확하게 초기화했다.
+
+```c
+heap_start = (block_header_t *)initial_mem;
+```
+
+또한 메모리 크기 계산을 위한 정수 연산과 실제 메모리를 가리키는 포인터 연산을 명확하게 분리했다.
+
+### 고찰
+
+이번 문제를 통해 **주소값과 크기값은 모두 64비트 정수로 표현될 수 있지만 의미는 완전히 다르다**는 점을 확인했다.
+
+특히 커널 메모리 관리에서는 작은 포인터 연산 실수도 즉시 낮은 주소 영역의 Data Abort로 이어질 수 있기 때문에, 주소와 크기를 명확하게 구분하는 것이 중요하다.
+
+---
+
+## 3. 페이지 디스크립터 주소 마스킹 및 페이지 테이블 초기화 오류
+
+### 문제 상황
+
+MMU를 활성화한 후 가상 주소를 물리 주소로 변환하는 `mmu_translate()` 테스트에서 정상적인 물리 주소 대신:
+
+```text
+0x707
+0x403
+```
+
+등의 비정상적인 값이 반환되었다.
+
+### 디버깅 및 추적
+
+반환값의 비트 패턴을 분석한 결과 `0x707`은 실제 물리 주소가 아니라 MMU Mapping Attribute에 사용되는 하위 비트와 일치했다.
+
+따라서 L3 Page Descriptor에서 물리 주소를 추출하는 비트 마스킹 로직을 집중적으로 확인했다.
+
+### 근본 원인
+
+페이지 디스크립터에서 물리 주소를 추출하는 과정에서 비트 반전 연산을 잘못 사용하여 **실제 물리 주소 영역을 제거하고 속성 비트만 남기는 문제**가 있었다.
+
+추가적으로 UART와 같은 Device Mapping에서는 주소에 Execute Never 등의 속성 비트가 섞여 들어갈 가능성도 있었다.
+
+또 다른 문제는 새 Page Table을 PMM에서 할당한 후 메모리를 0으로 초기화하지 않았다는 것이었다.
+
+Page Table에는 사용하지 않는 엔트리가 반드시 `0`이어야 하는데, 이전 메모리의 쓰레기 값이 남아 있을 경우 하드웨어가 이를 유효한 Descriptor로 해석할 가능성이 있었다.
+
+### 해결
+
+물리 주소 추출 시 ARMv8-A 주소 비트 범위에 맞춰 명확한 주소 마스크를 사용했다.
+
+```c
+0x0000FFFFFFFFF000ULL
+```
+
+또한 새로운 Page Table을 할당할 때 4KB 전체를 0으로 초기화하도록 수정했다.
+
+```text
+Page Table 할당
+      ↓
+4KB 전체 Zero Initialize
+      ↓
+필요한 Entry만 설정
+```
+
+### 고찰
+
+페이지 테이블은 단순한 배열이 아니라 **CPU의 MMU가 직접 해석하는 하드웨어 자료구조**다.
+
+따라서 일반적인 자료구조와 달리 초기화되지 않은 메모리나 잘못된 비트 하나도 실제 주소 변환 오류로 이어질 수 있다는 점을 확인했다.
+
+---
+
+## 4. 동적 재매핑 시 TLB 무효화 및 Pipeline Synchronization 누락
+
+### 문제 상황
+
+동일한 가상 주소를 다른 물리 페이지로 변경하는 Dynamic Remapping 테스트에서 Page Table Entry는 새로운 물리 주소로 정상적으로 변경되었지만, 실제 메모리 접근에서는 이전 물리 페이지의 데이터가 계속 읽혔다.
+
+### 디버깅 및 추적
+
+Page Table Entry를 직접 확인한 결과:
+
+```text
+Page Table → 새로운 Physical Address
+```
+
+로 정상적으로 변경되어 있었다.
+
+따라서 Page Table 자체의 문제가 아니라 CPU가 **이전 주소 변환 결과를 계속 사용하고 있는 것**으로 판단했다.
+
+### 근본 원인
+
+ARMv8-A CPU는 성능 향상을 위해 Virtual Address → Physical Address 변환 결과를 TLB에 캐싱한다.
+
+따라서 Page Table Entry를 변경하더라도 기존 TLB Entry가 남아 있으면 CPU는 새로운 Page Table을 다시 읽지 않고 이전 주소 변환 결과를 사용할 수 있다.
+
+또한 ARM64의 Weakly-Ordered Memory Model에서는 메모리 접근 순서를 명확하게 보장하기 위해 적절한 Barrier가 필요하다.
+
+### 해결
+
+Dynamic Mapping 변경 후 다음과 같은 TLB Flush Sequence를 구현했다.
+
+```text
+Page Table 수정
+      ↓
+DSB ISH
+      ↓
+TLBI VMALLE1
+      ↓
+DSB ISH
+      ↓
+ISB
+```
+
+이를 `mmu_tlb_flush()`로 추상화하여 Mapping 변경 이후 TLB와 Pipeline이 새로운 Page Table 상태를 사용하도록 보장했다.
+
+### 고찰
+
+이번 문제를 통해 **메모리의 값이 변경되었다는 것과 CPU가 그 변경을 즉시 관찰한다는 것은 별개의 문제**라는 점을 확인했다.
+
+MMU를 직접 구현할 경우 Page Table 수정뿐만 아니라 TLB와 CPU Pipeline까지 함께 고려해야 한다.
+
+---
+
+## 5. GICv2 Group 설정 오류로 인한 Interrupt Storm
+
+### 문제 상황
+
+ARM Generic Timer와 GICv2를 연결하고 CPU Interrupt를 활성화한 뒤 Timer Interrupt가 발생하기 시작했지만, Interrupt Handler에서 빠져나오지 못하고 계속해서 Interrupt Vector로 재진입하는 문제가 발생했다.
+
+### 디버깅 및 추적
+
+Timer 주기를 변경해도 증상이 동일했다.
+
+또한:
+
+```text
+Interrupt 발생
+    ↓
+Handler 실행
+    ↓
+EOI
+    ↓
+eret
+    ↓
+즉시 다시 Interrupt
+```
+
+가 반복되는 것을 확인했다.
+
+따라서 Timer 주기 문제가 아니라 **GIC가 Interrupt를 정상적으로 Deactivate하지 못하고 있는 문제**로 범위를 좁혔다.
+
+### 근본 원인
+
+QEMU `virt` 환경에서 사용 중인 GICv2 설정과 기존 초기화 코드의 Interrupt Group 설정이 일치하지 않았다.
+
+기존 코드에서는:
+
+```text
+GICD_IGROUPR = 0xFFFFFFFF
+```
+
+를 사용하여 모든 Interrupt를 Group 1로 설정하고 있었다.
+
+이로 인해 현재 실행 환경에서 기대하는 Interrupt 처리 방식과 GIC의 Group 설정이 충돌했고, EOI 이후에도 Interrupt가 계속 재발생하는 문제가 발생했다.
+
+또한 Interrupt Handler에서 UART 출력과 같은 무거운 작업을 수행하면서 비동기 Interrupt와 메인 코드의 UART 접근이 충돌할 가능성도 존재했다.
+
+### 해결
+
+GIC 초기화 시 Interrupt를 Group 0으로 명시적으로 설정했다.
+
+```text
+GICD_IGROUPR = 0x00000000
+```
+
+또한 ISR에서는 불필요한 UART 출력을 제거하고 Timer Tick 증가와 같은 최소한의 작업만 수행하도록 단순화했다.
+
+```text
+Timer IRQ
+   ↓
+Timer Tick 증가
+   ↓
+Timer 재설정
+   ↓
+EOI
+   ↓
+Return
+```
+
+### 고찰
+
+Interrupt Handler는 일반적인 함수와 달리 **언제든 비동기적으로 실행될 수 있는 특수한 실행 영역**이다.
+
+따라서 ISR에서는 가능한 한 짧고 단순한 작업만 수행하고, 실제 처리 작업은 일반 실행 흐름이나 Scheduler에 넘기는 구조가 안정적이라는 점을 확인했다.
+
+---
+
+# 6. Scheduler Context Switch 시 IRQ Mask 상태 상속 문제
+
+### 문제 상황
+
+Preemptive Scheduler에서 Task를 여러 개 생성한 후 Timer Interrupt를 이용해 Context Switch를 수행했지만, 특정 Task가 한 번 실행된 이후 다음 Task로 정상적으로 전환되지 않는 문제가 발생했다.
+
+### 디버깅 및 추적
+
+Scheduler의 Task 선택 로직과 Context 구조를 확인한 결과 Task 자체의 상태와 Stack은 정상적으로 생성되고 있었다.
+
+문제는 **새 Task가 실행되는 시점의 CPU IRQ Mask 상태**였다.
+
+특히 Timer Interrupt Handler 내부에서 `schedule()`이 호출되고 Context Switch가 발생하면서, 새 Task가 Interrupt가 Mask된 실행 상태를 이어받을 수 있었다.
+
+이 경우 새 Task가 실행되더라도 Timer Interrupt가 다시 발생하지 않아 Preemptive Scheduling이 멈추게 된다.
+
+### 근본 원인
+
+Context Switch는 General Purpose Register와 Stack Pointer를 저장/복원하지만, 새 Task의 최초 실행 시점에서 CPU의 IRQ Mask 상태를 명확하게 보장하지 않았다.
+
+즉,
+
+```text
+Timer IRQ Handler
+      ↓
+schedule()
+      ↓
+Context Switch
+      ↓
+새 Task 실행
+      ↓
+IRQ Mask 상태 유지
+      ↓
+Timer IRQ 재발생 불가
+      ↓
+Scheduler 정지
+```
+
+와 같은 문제가 발생했다.
+
+### 해결
+
+새 Task가 최초 실행될 때 사용하는 `task_entry_trampoline`에서 IRQ Mask를 명시적으로 해제했다.
+
+```asm
+task_entry_trampoline:
+    msr daifclr, #2
+    isb
+    blr x19
+    bl task_exit
+```
+
+이를 통해 새로운 Task가 실행되기 시작하는 시점에 Timer Interrupt가 정상적으로 다시 활성화되도록 했다.
+
+### 결과
+
+수정 이후:
+
+```text
+Task B
+  ↓
+Task A
+  ↓
+Task B
+  ↓
+Task A
+```
+
+형태의 Preemptive Context Switch가 정상적으로 반복되는 것을 확인했다.
+
+---
+
+# 7. User Task 종료 후 Scheduler가 호출되지 않는 문제
+
+### 문제 상황
+
+EL0 User Task와 System Call 구현 이후 User Task 1이 `sys_exit()`까지 정상적으로 실행되었지만, Task가 종료된 이후 다음 User Task가 실행되지 않고 시스템이 멈추는 문제가 발생했다.
+
+당시 실행 흐름은 다음과 같았다.
+
+```text
+User Task 1
+    ↓
+sys_exit()
+    ↓
+task_exit()
+    ↓
+TASK_TERMINATED
+    ↓
+무한 대기
+```
+
+### 디버깅 및 추적
+
+`task_exit()`을 확인한 결과 Task의 상태를 `TASK_TERMINATED`로 변경한 후 IRQ를 Disable하고 `wfe`를 통해 무한 대기하도록 구현되어 있었다.
+
+문제는 **Task가 종료된 이후 CPU를 다른 실행 가능한 Task에게 넘기는 코드가 없었다는 것**이었다.
+
+Scheduler의 `schedule()`은 현재 Task 다음부터 `READY` 또는 `RUNNING` 상태의 Task를 탐색하도록 구현되어 있다.
+
+따라서 종료 직후 Scheduler를 호출하면 현재 Task를 자연스럽게 실행 대상에서 제외하고 다음 Task를 선택할 수 있었다.
+
+### 해결
+
+`task_exit()`의 실행 흐름을 다음과 같이 변경했다.
+
+```text
+현재 Task
+    ↓
+TASK_TERMINATED
+    ↓
+schedule()
+    ↓
+다음 READY/RUNNING Task 탐색
+    ↓
+Context Switch
+    ↓
+다음 Task 실행
+```
+
+핵심은 **`schedule()`을 호출하기 전에 IRQ를 Disable하지 않는 것**이다.
+
+종료한 Task가 Scheduler로 CPU를 넘긴 뒤에는 다시 실행되지 않아야 하므로, 기존의 IRQ Disable 후 무한 대기 구조를 제거하고 Scheduler가 다음 Task를 선택하도록 변경했다.
+
+### 결과
+
+수정 후 User Task의 전체 실행 흐름이 정상적으로 동작했다.
+
+```text
+User Task 1
+    ↓
+getpid
+    ↓
+write
+    ↓
+yield
+    ↓
+sleep
+    ↓
+wake up
+    ↓
+exit
+    ↓
+schedule()
+    ↓
+User Task 2
+    ↓
+System Calls
+    ↓
+exit
+    ↓
+모든 User Task 종료
+```
+
+최종적으로 다음 메시지가 출력되며 Phase 6 테스트가 통과했다.
+
+```text
+[TEST] [PASS] User Mode (EL0) & System Calls Verified!
+```
+
+---
+
+# 8. Phase 6 최종 검증 결과
+
+Phase 6에서는 단순한 EL0 진입뿐만 아니라 User Task와 Kernel의 전체 실행 경로를 검증했다.
+
+검증한 주요 기능은 다음과 같다.
+
+```text
+Kernel EL1
+   │
+   │ Context Switch
+   ▼
+User EL0
+   │
+   ├── getpid()
+   ├── write()
+   ├── yield()
+   ├── sleep()
+   └── exit()
+          │
+          ▼
+     SVC Exception
+          │
+          ▼
+   syscall_dispatch()
+          │
+          ▼
+      Scheduler
+          │
+          ├── Context Switch
+          ├── Sleep / Wakeup
+          └── Task Exit
+```
+
+실제 실행 결과:
+
+```text
+[User Task 1] Running in EL0.
+[User Task 1] Yielding CPU.
+[User Task 1] Back from yield. Sleeping 5 ticks.
+[User Task 1] Wokr up. Exiting.
+[TEST] [PASS] User Mode (EL0) & System Calls Verified!
+```
+
+또한 기존 Kernel Scheduler의 Task들도 정상적으로 종료되었으며 최종적으로:
+
+```text
+>> Kernel is now in idle state.
+```
+
+까지 도달했다.
+
+따라서 현재 구현에서는 **EL0 User Mode, SVC 기반 System Call, Timer 기반 Scheduling, Yield, Sleep/Wakeup, Task Exit까지의 기본 실행 흐름이 정상적으로 동작함을 확인했다.**
+
+---
+
+# 9. 전체 디버깅을 통해 얻은 고찰
+
+MiniOS를 구현하면서 발생한 문제들은 단순한 문법 오류보다는 **소프트웨어와 하드웨어의 경계에서 발생하는 문제**가 대부분이었다.
+
+특히 다음과 같은 관계를 직접 확인할 수 있었다.
+
+```text
+Compiler
+   ↕
+CPU Instruction Set
+   ↕
+Exception / Register
+   ↕
+MMU / TLB
+   ↕
+Interrupt Controller
+   ↕
+Scheduler
+   ↕
+User / Kernel Mode
+```
+
+일반적인 애플리케이션 개발에서는 추상화되어 있던 CPU Register, Exception Level, TLB, Interrupt Controller, Context Switch 등의 동작을 직접 다루면서, 작은 설정 오류 하나가 전체 시스템 정지로 이어질 수 있다는 것을 확인했다.
+
+이번 디버깅에서 가장 중요했던 것은 단순히 오류를 수정하는 것이 아니라,
+
+> **증상 → CPU 상태 확인 → 관련 하드웨어 레이어로 범위 축소 → 근본 원인 확인 → 최소한의 수정 → 테스트를 통한 검증**
+
+의 순서로 문제를 추적하는 과정이었다.
+
+이를 통해 MiniOS는 단순히 기능을 구현하는 프로젝트를 넘어, **ARM64 하드웨어와 Operating System이 실제로 어떻게 상호작용하는지 이해하고 검증하는 프로젝트**로 발전시킬 수 있었다.
+-e 
+
+
+=== ./vfs/vfs.h ===
+#ifndef VFS_H
+#define VFS_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+#define MAX_PATH_LEN    128
+#define MAX_FILENAME    32
+#define MAX_OPEN_FILES  32
+
+//File Access FLAG
+#define O_RDONLY        0x000
+#define O_WRONLY        0x001
+#define O_RDWR          0x002
+#define O_CREAT         0x040
+#define O_TRUNC         0x200
+
+//vnode type 
+typedef enum {
+    VNODE_TYPE_FILE,
+    VNODE_TYPE_DIR,
+    VNODE_TYPE_DEV
+} vnode_type_t;
+
+struct vnode;
+
+//VFS polymorphic interface via function pointer table
+typedef struct vnode_ops{
+    int (*open)(struct vnode *node, int flags);
+    int64_t (*read)(struct vnode *node, uint64_t offset, void *buf, size_t count);
+    int64_t (*write)(struct vnode *node, uint64_t offset, void *buf, size_t count);
+    int (*close)(struct vnode *node);
+    struct vnode* (*lookup)(struct vnode *parent, const char *name);
+    int (*create)(struct vnode *parent, const char *name, vnode_type_t type, struct vnode **out_node);
+} vnode_ops_t;
+
+//Virtual File System Node(vnode)
+typedef struct vnode{
+    char name[MAX_FILENAME];
+    vnode_type_t type;
+    size_t size;
+    void *interanl_data;
+    vnode_ops_t *ops;
+    struct vnode *parent;
+    struct vnode *child_head;
+    struct vnode *next_sibling;
+} vnode_t;
+
+//Open File Handle structure
+typedef struct file{
+    vnode_t *vnode;
+    uint64_t pos;   //current file r/w offset
+    int flags;      //open mode flag
+    int ref_count;  //reference count
+} file_t;
+
+//VFS open API
+void vfs_init(void);
+vnode_t* vfs_get_root(void);
+vnode_t* vfs_lookup(const char *path);
+file_t* vfs_open(const char *path, int flags);
+int64_t vfs_read(file_t *file, void *buf, size_t count);
+int64_t vfs_write(file_t *file, const void *buf, size_t count);
+int vfs_close(file_t *file);
+
+#endif-e 
+
+
+=== ./vfs/vfs.c ===
+#include "vfs.h"
+#include "heap.h"
+#include "uart.h"
+
+static vnode_t *root_vnode = NULL;
+
+//String utility 
+static int vfs_strcmp(const char *s1, const char *s2){
+    while(*s1 && (*s1 == *s2)) {s1++, s2++;}
+    return *(const unsigned char*)s1 - *(const unsigned char*)s2;
+}
+
+
+static void vfs_strncpy(char *dest, const char *src, size_t n){
+    size_t i;
+    for(i = 0; i < n-1 && src[i] != '\0'; i++){
+        dest[i] = src[i];
+    }
+    dest[i] = '\0';
+}
+
+vnode_t* vfs_create_vnode(const char *name, vnode_type_t type, vnode_ops_t *ops){
+    vnode_t *node = (vnode_t *)kmalloc(sizeof(vnode_t));
+    if(!node) return NULL;
+
+    vfs_strncpy(node->name, name, MAX_FILENAME);
+    node->type = type;
+    node->size = 0;
+    node->interanl_data = NULL;
+    node->ops = ops;
+    node->parent = NULL;
+    node->child_head = NULL;
+    node->next_sibling = NULL;
+
+    return node;
+}
+
+void vfs_add_child(vnode_t *parent, vnode_t *child){
+    if(!parent || !child) return;
+    child->parent = parent;
+    child->next_sibling = parent->child_head;
+    parent->child_head = child;
+}
+
+
+//path parsing and hierarchical vnode lookup engine
+vnode_t* vfs_lookup(const char *path){
+    if(!path || path[0] != '/') return NULL;
+    if(path[1] == '\0') return root_vnode;
+
+    vnode_t *curr = root_vnode;
+    char token[MAX_FILENAME];
+    const char *p = path + 1;
+
+    while (*p)
+    {
+        size_t len = 0;
+        while (*p && *p != '/'){
+            if(len <MAX_FILENAME - 1){
+                token[len++] = *p;
+            }
+            p++;
+        }
+        token[len] = '\0';
+        if(*p == '/') p++;
+
+        if(len == 0) continue;
+
+        //Lookup a child node from the curr dir node
+        if(curr->type != VNODE_TYPE_DIR) return NULL;
+        
+        vnode_t *child = curr->child_head;
+        vnode_t *found = NULL;
+        
+        while (child)
+        {
+            if(vfs_strcmp(child->name, token) == 0){
+                found = child;
+                break;
+            }
+            child = child->next_sibling;
+        }
+        
+        if(!found){
+            if(curr->ops && curr->ops->lookup){
+                found = curr->ops->lookup(curr, token);
+            }
+        }
+
+        if(!found) return NULL;
+        curr = found;
+    }
+    
+    return curr;
+}
+
+file_t* vfs_open(const char *path, int flags){
+    vnode_t *node = vfs_lookup(path);
+    
+    if(!node && (flags & O_CREAT)){
+        char parent_path[MAX_PATH_LEN];
+        char filename[MAX_FILENAME];
+
+        vfs_strncpy(parent_path, path, MAX_PATH_LEN);
+        int last_slash = -1;
+        for(int i=0; parent_path[i] != '\0';i++){
+            if(parent_path[i] = '/') last_slash = i;
+        }
+
+        if(last_slash == 0){
+            vfs_strncpy(parent_path, '/', MAX_PATH_LEN);
+            vfs_strncpy(filename, path + 1, MAX_FILENAME);
+        }
+        else if (last_slash > 0)
+        {
+            parent_path[last_slash] = '\0';
+            vfs_strncpy(filename, path + last_slash + 1, MAX_FILENAME);
+        }
+        else{
+            return NULL;
+        }
+
+        vnode_t *parent = vfs_lookup(parent_path);
+        if(parent && parent->ops && parent->ops->create){
+            parent->ops->create(parent, filename, VNODE_TYPE_FILE, &node);
+        }            
+    }
+    if(!node) return NULL;
+
+    if(node->ops && node->ops->open){
+        if(node->ops->open(node, flags) < 0) return NULL;
+    }
+
+    file_t *file = (file_t *)kmalloc(sizeof(file_t));
+    if(!file) return NULL;
+
+    file->vnode = node;
+    file->pos = 0;
+    file->flags = flags;
+    file->ref_count = 1;
+
+    return file;
+}
+
+int64_t vfs_read(file_t *file, void *buf, size_t count){
+    if(!file || !file->vnode || !file->vnode->ops || !file->vnode->ops->read) return -1;
+
+    int64_t bytes_read = file->vnode->ops->read(file->vnode, file->pos, buf, count);
+    if(bytes_read > 0){
+        file->pos +=bytes_read;
+    }
+    return bytes_read;
+}
+
+int64_t vfs_write(file_t *file, const void *buf, size_t count){
+    if(!file || !file->vnode || !file->vnode->ops || !file->vnode->ops->read) return -1;
+
+    int64_t bytes_written = file->vnode->ops->write(file->vnode, file->pos, buf, count);
+    if(bytes_written > 0){
+        file->pos += bytes_written;
+    }
+    return bytes_written;
+}
+
+int vfs_close(file_t *file){
+    if(!file) return -1;
+
+    file->ref_count--;
+    if(file->ref_count <= 0){
+        if(file->vnode && file->vnode->ops && file->vnode->ops->close){
+            file->vnode->ops->close(file->vnode);
+        }
+        kfree(file);
+    }
+    return 0;
+}
+
+vnode_t* vfs_get_root(void){
+    return root_vnode;
+}
+
+void vfs_inint(void){
+
+    root_vnode = vfs_create_vnode("", VNODE_TYPE_DIR, NULL);
+    uart_puts("[VFS] Virtual File System Infrastructured Initialized.\n");
+}-e 
+
+
+=== ./vfs/ramfs.c ===
+#include "ramfs.h"
+#include "heap.h"
+#include "uart.h"
+
+typedef struct ramfs_node{
+    uint8_t *data;
+    size_t capacity;
+}ramfs_node_t;
+
+static void ramfs_memcpy(void *dest, const void *src, size_t n){
+    uint8_t *d = (uint8_t *)dest;
+    const uint8_t *s = (const uint8_t *)src;
+    while(n--) *d++ = *s++;
+}
+
+static int ramfs_open(vnode_t *node, int flags){
+    (void)flags;
+    return (node !=NULL) ? 0 : -1;
+}
+
+static int64_t ramfs_read(vnode_t *node, uint64_t offset, void *buf, size_t count){
+    if(!node || node->type != VNODE_TYPE_FILE) return -1;
+    if(offset >= node->size) return 0; // EOF
+
+    size_t read_bytes = count;
+    if(offset + read_bytes > node->size){
+        read_bytes = node->size - offset;
+    }
+
+    ramfs_node_t *rdata = (ramfs_node_t *)node->interanl_data;
+    if(!rdata || !rdata->data) return -1;
+
+    ramfs_memcpy(buf, rdata->data + offset, read_bytes);
+    return read_bytes;
+}
+
+static int64_t ramfs_write(vnode_t *node, uint64_t offset, const void *buf, size_t count){
+    if(!node || node->type !=VNODE_TYPE_FILE) return -1;
+    
+    ramfs_node_t *rdata = (ramfs_node_t *)node->interanl_data;
+    if(!rdata) return -1;
+
+    if(offset + count > rdata->capacity){
+        size_t new_cap = (offset + count) * 2;
+        if(new_cap < 128) new_cap = 128;
+
+        uint8_t *new_buf = (uint8_t *)kmalloc(new_cap);
+        if(!new_buf) return -1;
+
+        if(rdata->data){
+            ramfs_memcpy(new_buf, rdata->data, node->size);
+            kfree(rdata->data);
+        }
+        rdata->data = new_buf;
+        rdata->capacity = new_cap;
+    }
+
+    ramfs_memcpy(rdata->data + offset, buf, count);
+    if(offset + count > node->size){
+        node->size = offset + count;
+    }
+    return count;
+}
+
+static int ramfs_close(vnode_t *node){
+    (void)node;
+    return 0;
+}
+
+static int ramfs_create(vnode_t *parent, const char *name, vnode_type_t type, vnode_t **out_node);
+
+static vnode_ops_t ramfs_ops = {
+    .open = ramfs_open,
+    .read = ramfs_read,
+    .write = ramfs_write,
+    .close = ramfs_close,
+    .lookup = NULL,
+    .create = ramfs_create
+};
+
+static int ramfs_create(vnode_t *parent, const char *name, vnode_type_t type, vnode_t **out_node){
+    extern vnode_t* vfs_create_vnode(const char *name, vnode_type_t type, vnode_ops_t *ops);
+    extern void vfs_add_child(vnode_t *parent, vnode_t *child);
+
+    vnode_t *child = vfs_create_vnode(name, type, &ramfs_ops);
+    if(!child) return -1;
+
+    if(type == VNODE_TYPE_FILE){
+        ramfs_node_t *rdata = (ramfs_node_t *)kmalloc(sizeof(ramfs_node_t));
+        rdata->data = NULL;
+        rdata->capacity = 0;
+        child->interanl_data = rdata;
+    }
+
+    vfs_add_child(parent, child);
+    if(out_node) *out_node = child;
+
+    return 0;
+}
+
+vnode_t* ramfs_mount(const char *mount_point){
+    vnode_t *root = vfs_get_root;
+    vnode_t *mnt_node = NULL;
+
+    if(ramfs_create(root, mount_point, VNODE_TYPE_DIR, &mnt_node) < 0){
+        uart_puts("[RamFS ERROR] Failed to mount RamFS.\n");
+        return NULL;
+    }
+
+    uart_puts("[RamFS] Mounted successfully at /");
+    uart_puts(mount_point);
+    uart_puts("\n");
+
+    return mnt_node;
+}
+
+void ramfs_init(void){
+    ramfs_mount("ram");
+}
+-e 
+
+
+=== ./vfs/devfs.h ===
+#ifndef DEVFS_H
+#define DEVFS_H
+
+#include "vfs.h"
+
+void devfs_init(void);
+
+#endif-e 
+
+
+=== ./vfs/ramfs.h ===
+#ifndef RAMFS_H
+#define RAMFS_H
+
+#include "vfs.h"
+
+void ramfs_init(void);
+vnode_t* ramfs_mount(const char *mount_point);
+
+#endif-e 
+
+
+=== ./vfs/devfs.c ===
+#include "devfs.h"
+#include "uart.h"
+
+static int devfs_console_open(vnode_t *node, int flags){
+    (void)node;
+    (void)flags;
+    return 0;    
+}
+
+static int64_t devfs_console_read(vnode_t *node, uint64_t offset, void *buf, size_t count){
+    (void)node;
+    (void)offset;
+    (void)buf;
+    (void)count;
+
+    return 0;
+}
+static int64_t devfs_console_write(vnode_t *node, uint64_t offset, const void *buf, size_t count){
+    (void)node;
+    (void)offset;
+
+    const char *str = (const char *)buf;
+    for(size_t i = 0; i < count; i++){
+        uart_putc(str[i]);
+    }
+
+    return count;
+}
+
+static int devfs_console_close(vnode_t *node){
+    (void)node;
+    return 0;
+}
+
+static vnode_ops_t devfs_console_ops = {
+    .open = devfs_console_open,
+    .read = devfs_console_read,
+    .write = devfs_console_write,
+    .close = devfs_console_close,
+    .lookup = NULL,
+    .create = NULL
+};
+
+void devfs_init(void){
+    extern vnode_t* vfs_create_vnode(const char *name, vnode_type_t type, vnode_ops_t *ops);
+    extern void vfs_add_child(vnode_t *parent, vnode_t *child);
+
+    vnode_t *root = vfs_get_root();
+
+    //create /dev directory
+    vnode_t *dev_dir = vfs_create_vnode("dev", VNODE_TYPE_DIR, NULL);
+    vfs_add_child(root, dev_dir);
+
+    // create /dev/console device node and UART driver mapping
+    vnode_t *console_node = vfs_create_vnode("console",VNODE_TYPE_DEV, &devfs_console_ops);
+    vfs_add_child(dev_dir, console_node);
+
+    uart_puts("[DevFS] Mounted /dev/console (PL011 UART Device Node).\n");
+}
+-e 
+
+
+=== ./kernel/kernel.c ===
+#include "uart.h"
+#include "exception.h"
+#include "pmm.h"
+#include "heap.h"
+#include "mmu.h"
+#include "gic.h"
+#include "timer.h"
+#include "sched.h"
+#include "syscall.h"
+#include "vfs.h"
+#include "ramfs.h"
+#include "devfs.h"
+
+#ifdef ENABLE_TESTS
+#include "test.h"
+#endif
+
+extern char __stack_top[];
+extern char __kernel_end[];
+
+static inline uint64_t read_sp(void){
+    uint64_t sp;
+    asm volatile("mov %0, sp" : "=r"(sp));
+    return sp;
+}
+
+void kernel_main(void) {
+    
+    uart_init();
+    uart_puts("\n=======================================\n");
+    uart_puts("  MiniOS (ARM64) Successfully Booted!  \n");
+    uart_puts("=======================================\n");
+
+    exception_init();
+    uart_puts("[OK] Exception Vector Table Registered.\n");
+
+    pmm_init();
+    uart_puts("[OK] Physical Memory Manager (PMM) Initialized.\n");
+
+    heap_init();
+    uart_puts("[OK] Kernel Heap Allocator (kmalloc) Initialized.\n");
+
+    mmu_init();
+    uart_puts("[OK] ARM64 MMU & 4-Level Paging Activated.\n");
+
+#ifdef ENABLE_TESTS
+    uart_puts(">> Running Unit Tests...\n");
+    test_pmm_allocator();
+    test_heap_allocator();
+    test_mmu_virtual_memory();
+#endif
+    
+    gic_init();
+    uart_puts("[OK] GICv2 Interrupt Controller Initialized.\n");
+
+    timer_init(100);
+    uart_puts("[OK] ARM Generic Timer Initialized.\n");
+    
+    sched_init(read_sp());
+    uart_puts("[OK] Preemptive Scheduler Initialized.\n");
+
+    syscall_init();
+    uart_puts("[OK] System Call Table Initialized.\n");
+
+    vfs_init();
+    uart_puts("[OK] Virtual File System Infrastructure Initialized.\n");
+
+    ramfs_init();
+    uart_puts("[OK] RamFS Initialized and Mounted on /ram.\n");
+
+    devfs_init();
+    uart_puts("[OK] DevFS Initialized and Mounted on /dev.\n");
+
+    enable_irq();
+    uart_puts("[OK] CPU Global Interrupts Unmasked.\n");
+
+
+#ifdef ENABLE_TESTS
+    test_timer_ticks();
+    test_scheduler_preemption();
+    test_user_mode();
+    test_vfs_subsystem();
+#endif
+    uart_puts(">> Kernel is now in idle state.\n");
+
+    while (1)
+    {
+        asm volatile("wfi");
+    }
+
+}-e 
+
+
+=== ./kernel/exception.h ===
+#ifndef EXCEPTION_H
+#define EXCEPTION_H
+
+#include <stdint.h>
+
+typedef struct{
+    uint64_t x[30]; //240B
+    uint64_t lr; //8B
+    uint64_t elr_el1; //8B
+    uint64_t spsr_el1;//8B
+    uint64_t unused; //to packing for 272B 
+} trap_frame_t;
+
+void exception_init(void);
+
+static inline void enable_irq(void){
+    asm volatile("msr daifclr, #2" ::: "memory");//Bit 1 (I bit) clear -> enable IRQ
+
+}
+
+static inline void disable_irq(void){
+    asm volatile("msr daifset, #2" ::: "memory");//Bit 1 (I bit) set  -> disable IRQ
+}
+
+void handle_el1_sync(trap_frame_t *tf, uint64_t esr, uint64_t far);
+void handle_el1_irq(void);
+void handle_lower_sync(trap_frame_t *tf, uint64_t esr, uint64_t far);
+void handle_lower_irq(void);
+void handle_unknown_exception(trap_frame_t *tf, uint64_t esr, uint64_t far);
+
+#endif-e 
+
+
+=== ./kernel/exception.c ===
+#include <exception.h>
+#include <uart.h>
+#include <gic.h>
+#include <timer.h>
+#include <sched.h>
+#include <syscall.h>
+
+extern char exception_vector_table[];
+
+void exception_init(void)
+{
+    asm volatile("msr vbar_el1, %0" : : "r"(exception_vector_table) : "memory");
+    asm volatile("isb");
+}
+
+static const char* decode_exception_class(uint64_t ec){
+    switch(ec){
+        case 0x00: return "Unknown Reason";
+        case 0x01: return "Trapped WFI/WFE Instruction";
+        case 0x07: return "Trapped Access to SVE/Advanced SIMD/FP (FPU Trap)";
+        case 0x0E: return "Illegal  Execution state";
+        case 0x15: return "SVC Instruction Execution (Syscall AArch64)";
+        case 0x20: return "Instruction Abort (Lower EL)";
+        case 0x21: return "Instruction Abort (Current EL)";
+        case 0x22: return "PC Alignment Falult";
+        case 0x24: return "Data Abort (Lower EL)";
+        case 0x25: return "Data Abort (Current EL - Invalid Memory Access)";
+        case 0x26: return "SP Alignment Fault";
+        default:   return "Reversed / Unhandled Exception Class";
+    }
+}
+
+static void print_panic_dump(trap_frame_t *tf, uint64_t esr, uint64_t far, const char *title){
+    uint64_t ec = (esr >> 26) & 0x3F;
+
+    uart_puts("\n=======================================================\n");
+    uart_puts("                 [KERNEL PANIC OCCUREED]               \n");
+    uart_puts("=======================================================\n");
+    uart_puts("Type                 :"); uart_puts(title); uart_puts("\n");
+    uart_puts("Faulting PC (ELR)    :"); uart_put_hex(tf->elr_el1); uart_puts("\n");
+    uart_puts("Fault Address (FAR)  :"); uart_put_hex(far); uart_puts("\n");
+    uart_puts("Syndrome (ESR)       :"); uart_put_hex(esr); uart_puts("\n");
+    uart_puts("Class Description    :"); uart_puts(decode_exception_class(ec)); uart_puts("\n\n");
+
+    uart_puts("--- General Purpose Register (Trap Frame Dump) ----\n");
+    for(int i = 0;i < 30;i += 2){
+        uart_puts("X");
+        if(i < 10) uart_putc('0' + i);
+        else {uart_putc('0' + (i/10)); uart_putc('0' + (i%10));}
+        uart_puts(": ");
+        uart_put_hex(tf->x[i]);
+
+        uart_puts("    X");
+        if((i+1) < 10) uart_putc('0' + (i+1));
+        else {uart_putc('0' + ((i+1) / 10)); uart_putc('0' + ((i+1) % 10));}
+        uart_puts(": ");
+        uart_put_hex(tf->x[i+1]);
+        uart_puts("\n");
+    }
+    uart_puts("LR (X30) : "); uart_put_hex(tf->lr);
+    uart_puts("   SPSR_EL1: "); uart_put_hex(tf->spsr_el1);
+    uart_puts("\n=======================================================\n");
+}
+
+void handle_el1_sync(trap_frame_t *tf, uint64_t esr, uint64_t far){
+    print_panic_dump(tf, esr, far, "Synchronous Exception inside Kernel (EL1)");
+    while (1)
+    {
+        asm volatile("wfe");
+    }
+}
+
+void handle_el1_irq(void){
+    //to get irq_it
+    uint32_t irq_id = gic_acknowledge_irq();
+
+    if(irq_id >= 1020){
+        return;
+    }
+    if(irq_id == IRQ_TIMER_PHYS_NS){
+        timer_handle_irq();
+
+        gic_end_of_irq(irq_id);
+
+        sched_tick();
+        return;
+    }
+
+    gic_end_of_irq(irq_id);
+}
+
+void handle_lower_sync(trap_frame_t *tf, uint64_t esr, uint64_t far){
+    uint64_t ec = (esr >> 26) & 0x3F;
+
+    if(ec == 0x15){
+        syscall_dispatch(tf);
+        uart_puts("[SYSCALL] System Call Invoked from User Mode!\n");
+        return;
+    }
+
+    print_panic_dump(tf, esr, far, "User Space (EL0) Exception\n");
+    uart_puts("[KERNEL] Terminating Malicious/Faulty User Task...\n");
+    task_exit();
+}
+
+void handle_lower_irq(void){
+    uint32_t irq_id = gic_acknowledge_irq();
+
+    if(irq_id >= 1020){
+        return;
+    }
+    if(irq_id == IRQ_TIMER_PHYS_NS){
+        timer_handle_irq();
+
+        gic_end_of_irq(irq_id);
+
+        sched_tick();
+        return;
+    }
+
+    gic_end_of_irq(irq_id);
+}
+
+void handle_unknown_exception(trap_frame_t *tf, uint64_t esr, uint64_t far){
+    print_panic_dump(tf, esr, far, "Unknown / Unexpected Trap Vector");
+    while(1);
+}
+-e 
+
+
+=== ./kernel/memory_layout.h ===
+#ifndef MEMORY_LAYOUT_H
+#define MEMORY_LAYOUT_H
+
+#include <stdint.h>
+
+#define RAM_START       0x40000000ULL
+#define RAM_SIZE        0x08000000ULL
+#define RAM_END         (RAM_START +RAM_SIZE)
+
+#define PAGE_SIZE       0x1000ULL
+
+#define USER_START      0x47000000ULL
+#define USER_SIZE       0x01000000ULL
+#define USER_END        (USER_START + USER_SIZE)
+
+#define USER_STACK_TOP  0x47FFF000ULL
+
+
+#endif-e 
+
+
+=== ./test/test_user.c ===
+#include "test.h"
+#include "syscall.h"
+#include "sched.h"
+#include "uart.h"
+#include "task.h"
+
+//user RO data
+#define USER_RODATA \
+    __attribute__((section(".user_rodata"),aligned(16)))
+
+static const char user1_msg1[] USER_RODATA = "[User Task 1] Running in EL0.\n";
+static const char user1_msg2[] USER_RODATA = "[User Task 1] Yielding CPU.\n";
+static const char user1_msg3[] USER_RODATA = "[User Task 1] Back from yield. Sleeping 5 ticks.\n";
+static const char user1_msg4[] USER_RODATA = "[User Task 1] Wokr up. Exiting.\n";
+
+static const char user2_msg1[] USER_RODATA = "[User Task 1] Running in EL0.\n";
+static const char user2_msg2[] USER_RODATA = "[User Task 1] Work finished. Exiting.\n";
+
+//user code
+
+#define USER_TEXT \
+    __attribute__((section(".user_text"),aligned(16)))
+
+static void user_process_1(void) USER_TEXT;
+static void user_process_2(void) USER_TEXT;
+
+
+static void user_process_1(void){
+    //TEST SYS_GETPID
+    int64_t pid = sys_getpid();
+    (void)pid;
+
+    //TEST SYS_WRITE
+    sys_write(1,user1_msg1,sizeof(user1_msg1)-1);
+
+    //TEST SYS_YIELD
+    sys_write(1,user1_msg2,sizeof(user1_msg2)-1);
+    sys_yield();
+
+    
+    //TEST SYS_SLEEP
+    sys_write(1,user1_msg3,sizeof(user1_msg3)-1);
+    sys_sleep(5);
+    
+    //TEST WAKE_UP
+    sys_write(1,user1_msg4,sizeof(user1_msg4)-1);
+
+    //TEST SYS_EXIT
+    sys_exit(0);
+}
+
+static void user_process_2(void){
+    //TEST SYS_GETPID
+    int64_t pid = sys_getpid();
+    (void)pid;
+
+    //TEST SYS_WRITE
+    sys_write(1,user2_msg1,sizeof(user2_msg1)-1);
+
+    sys_write(1,user2_msg2,sizeof(user2_msg2)-1);
+  
+    //TEST SYS_EXIT
+    sys_exit(0);
+}
+
+void test_user_mode(void){
+    uart_puts("\n[TEST] ================================================\n");
+
+    uart_puts("[TEST]      Starting Phase 6: User Mode (EL0) & SVC\n");
+
+    uart_puts("[TEST] ================================================\n");
+
+
+    task_struct_t *task1 =task_create_user(user_process_1);
+
+    task_struct_t *task2 =task_create_user(user_process_2);
+
+
+    if(!task1 || !task2)
+    {
+        uart_puts("[TEST] [FAIL] Failed to create User Tasks!\n");
+        return;
+    }
+
+
+    uart_puts("[TEST] User Tasks Created.\n");
+
+    uart_puts("[TEST] Waiting for User Tasks...\n");
+
+
+    while(sched_get_live_user_tasks() != 0)
+    {
+        asm volatile("wfi");
+    }
+
+
+    uart_puts("[TEST] [PASS] User Mode (EL0) & System Calls Verified!\n");
+
+    uart_puts("=======================================================\n\n");
+}-e 
+
+
+=== ./test/test_exception.c ===
+#include "uart.h"
+#include <stdint.h>
+
+void test_exception_abort(void){
+    uart_puts("\n[TEST]------------------------------------\n");
+    uart_puts("\n[TEST] Triggering Intentional Data Abort...\n");
+    uart_puts("\n[TEST]------------------------------------\n");
+
+    volatile uint64_t *invalid_addr = (volatile uint64_t *)0XDEADBEEF0000;
+    *invalid_addr = 0X12345678;
+
+    uart_puts("[FAIL] This message must NOT be printed.\n");
+}-e 
+
+
+=== ./test/test_vfs.c ===
+#include "test.h"
+#include "vfs.h"
+#include "syscall.h"
+#include "uart.h"
+
+void user_vfs_test_task(void) {
+    sys_write(1, "\n[USER TASK] Starting VFS & RamFS & DevFS Test in EL0...\n", 57);
+
+    // 1. DevFS (/dev/console) 쓰기 테스트
+    int console_fd = (int)sys_open("/dev/console", O_WRONLY);
+    if (console_fd >= 0) {
+        sys_write(console_fd, "[TEST PASS] Writing directly to /dev/console via DevFS!\n", 56);
+        sys_close(console_fd);
+    } else {
+        sys_write(1, "[TEST FAIL] Failed to open /dev/console\n", 40);
+    }
+
+    // 2. RamFS (/ram/hello.txt) 파일 생성 및 쓰기/읽기 검증
+    int file_fd = (int)sys_open("/ram/hello.txt", O_CREAT | O_RDWR);
+    if (file_fd >= 0) {
+        const char *msg = "MiniOS AArch64 VFS Framework Operational!";
+        sys_write(file_fd, msg, 42);
+        sys_close(file_fd);
+
+        // 파일 재오픈 후 읽기 검증
+        int read_fd = (int)sys_open("/ram/hello.txt", O_RDONLY);
+        if (read_fd >= 0) {
+            char read_buf[64] = {0};
+            int64_t read_bytes = sys_read(read_fd, read_buf, 64);
+            sys_close(read_fd);
+
+            if (read_bytes > 0) {
+                sys_write(1, "[TEST PASS] Read from /ram/hello.txt: \"", 39);
+                sys_write(1, read_buf, read_bytes);
+                sys_write(1, "\"\n", 2);
+            }
+        }
+    } else {
+        sys_write(1, "[TEST FAIL] Failed to create /ram/hello.txt\n", 44);
+    }
+
+    sys_write(1, ">> VFS Infrastructure Integration Tests Completed Successfully!\n\n", 64);
+    sys_exit(0);
+}-e 
+
+
+=== ./test/test_timer.c ===
+#include "test.h"
+#include "timer.h"
+#include "uart.h"
+
+void test_timer_ticks(void) {
+    uart_puts("\n[TEST] ================================================\n");
+    uart_puts("[TEST]    Starting Hardware Timer & GICv2 Unit Tests   \n");
+    uart_puts("[TEST] ================================================\n");
+
+    uint64_t start_tick = timer_get_ticks();
+    uart_puts("[TEST] Waiting for 10 Timer Ticks (~100ms)...\n");
+
+    // 10틱(약 100ms) 대기
+    timer_sleep_ticks(10);
+    
+
+    uint64_t end_tick = timer_get_ticks();
+    uart_puts("[TEST] Start Tick: ");
+    uart_put_hex(start_tick);
+    uart_puts(" -> End Tick: ");
+    uart_put_hex(end_tick);
+    uart_puts("\n");
+
+    if (end_tick >= start_tick + 10) {
+        uart_puts("[TEST] [PASS] Hardware Timer & Interrupt Processing OK!\n");
+    } else {
+        uart_puts("[TEST] [FAIL] Timer Ticks did not increase properly!\n");
+    }
+    uart_puts("=======================================================\n\n");
+}-e 
+
+
+=== ./test/test_sched.c ===
+#include "test.h"
+#include "sched.h"
+#include "timer.h"
+#include "uart.h"
+
+static volatile int task_a_counter = 0;
+static volatile int task_b_counter = 0;
+
+static void task_worker_a(void) {
+    while (task_a_counter < 3) {
+        uart_puts("  [Task A] Executing... tick=");
+        uart_put_hex(timer_get_ticks());
+        uart_puts("\n");
+        task_a_counter++;
+        timer_sleep_ticks(10);
+    }
+    uart_puts("  [Task A] Work Finished -> Exiting.\n");
+}
+
+static void task_worker_b(void) {
+    while (task_b_counter < 3) {
+        uart_puts("  [Task B] Executing... tick=");
+        uart_put_hex(timer_get_ticks());
+        uart_puts("\n");
+        task_b_counter++;
+        timer_sleep_ticks(10);
+    }
+    uart_puts("  [Task B] Work Finished -> Exiting.\n");
+}
+
+void test_scheduler_preemption(void) {
+    uart_puts("\n[TEST] ================================================\n");
+    uart_puts("[TEST]    Starting Multitasking & Scheduler Tests      \n");
+    uart_puts("[TEST] ================================================\n");
+
+    task_create(task_worker_a);
+    task_create(task_worker_b);
+
+    uart_puts("[TEST] Tasks Created. Waiting for Preemptive Context Switches...\n");
+
+    while (task_a_counter < 3 || task_b_counter < 3) {
+        asm volatile("wfi");
+    }
+
+    uart_puts("[TEST] [PASS] Preemptive Multitasking Successfully Verified!\n");
+    uart_puts("=======================================================\n\n");
+}-e 
+
+
+=== ./test/test.h ===
+#ifndef TEST_H
+#define TEST_H
+
+void test_exception_abort(void);
+void test_pmm_allocator(void);
+void test_heap_allocator(void);
+void test_mmu_virtual_memory(void);
+void test_timer_ticks(void);
+void test_scheduler_preemption(void);
+void test_user_mode(void);
+void user_vfs_test_task(void);
+
+#endif-e 
+
+
+=== ./test/test_pmm.c ===
+#include "test.h"
+#include "pmm.h"
+#include "uart.h"
+
+void test_pmm_allocator(void){
+    uart_puts("\n[TEST] --- starting PMM Unit Tests --- \n");
+
+    uint64_t initial_free = pmm_get_free_pages();
+    uart_puts("[TEST] Initial Free pages:");
+    uart_put_hex(initial_free);
+    uart_puts("\n");
+
+    void *page1 = pmm_alloc_page();
+    void *page2 = pmm_alloc_page();
+
+    uart_puts("[TEST] Allocated page 1: ");
+    uart_put_hex((uint64_t)page1);
+    uart_puts("\n");
+
+    uart_puts("[TEST] Allocated page 2: ");
+    uart_put_hex((uint64_t)page2);
+    uart_puts("\n");
+
+    pmm_free_page(page1);
+    void *page1_realloc = pmm_alloc_page();
+    uart_puts("[TEST] Re-allocated page: ");
+    uart_put_hex((uint64_t)page1_realloc);
+    uart_puts(" (Expected same as Page 1)\n");
+
+
+    void *multi_pages = pmm_alloc_pages(4);
+    uart_puts("[TEST] Allocated 4 pages: ");
+    uart_put_hex((uint64_t)multi_pages);
+    uart_puts("\n");
+
+    pmm_free_pages(multi_pages, 4);
+    pmm_free_page(page2);
+    pmm_free_page(page1_realloc);
+
+    uint64_t final_free = pmm_get_free_pages();
+    uart_puts("[TEST] Final Free Pages  : ");
+    uart_put_hex(final_free);
+    uart_puts("\n");
+
+    if (initial_free == final_free) {
+        uart_puts("[TEST] [PASS] PMM All Tests Passed Successfully!\n\n");
+    } else {
+        uart_puts("[TEST] [FAIL] Memory Leak Detected in PMM!\n\n");
+    }
+
+}-e 
+
+
+=== ./test/test_heap.c ===
+#include "test.h"
+#include "heap.h"
+#include "uart.h"
+
+void test_heap_allocator(void){
+    uart_puts("\n[TEST] --- Starting Kernel Heap (kmalloc/kfree) Unit Tests --- \n");
+
+    void *ptr1 = kmalloc(32);
+    void *ptr2 = kmalloc(128);
+    void *ptr3 = kmalloc(512);
+
+    uart_puts("[TEST] kmalloc(32) Address: ");
+    uart_put_hex((uint64_t)ptr1);
+    uart_puts("\n");
+   
+    uart_puts("[TEST] kmalloc(128) Address: ");
+    uart_put_hex((uint64_t)ptr2);
+    uart_puts("\n");
+    
+    uart_puts("[TEST] kmalloc(512) Address: ");
+    uart_put_hex((uint64_t)ptr3);
+    uart_puts("\n");
+
+    uint8_t *byte_arr = (uint8_t *)ptr1;
+    for(int i = 0; i < 32; i++){
+        byte_arr[i] = (uint8_t)(0xAA + i);
+    }
+    
+    int read_ok = 1;
+    for(int i = 0; i < 32; i++){
+        if(byte_arr[i] != (uint8_t)(0xAA + i)){
+            read_ok = 0;
+            break;
+        }
+    }
+    if(read_ok){
+        uart_puts("[TEST] Data Write/Read Test : PASS\n");
+    }
+    else{
+        uart_puts("[TEST] Data Write/Read Test : FAIL\n");
+    }
+
+    kfree(ptr1);
+    kfree(ptr2);
+    kfree(ptr3);
+
+    void *ptr_merged = kmalloc(600);
+    uart_puts("[TEST] kmalloc(600) (Reused): ");
+    uart_put_hex((uint64_t)ptr_merged);
+    uart_puts(" (Expected start near ptr1)\n");
+
+    kfree(ptr_merged);
+    uart_puts("[TEST] [PASS] Heap Allocator Tests Completed Successfully!\n\n");
+
+}-e 
+
+
+=== ./test/test_mmu.c ===
+#include <test.h>
+#include <mmu.h>
+#include <pmm.h>
+#include <uart.h>
+
+static void print_subtest(const char *name, int pass){
+    uart_puts("  ->  ");
+    uart_puts(name);
+    if(pass)    uart_puts(": [PASS]\n");
+    else        uart_puts(": [FAIL]\n");
+}
+
+
+
+void test_mmu_virtual_memory(void){
+    uart_puts("\n[TEST] ================================================\n");
+    uart_puts("[TEST]       Starting Comprehensive MMU Unit Tests     \n");
+    uart_puts("[TEST] ================================================\n");
+
+    uint64_t *root = mmu_get_root_table();
+    int overall_pass = 1;
+
+    //page table walk test
+    uart_puts("[1] Page Table Hardware Walk Test\n\n");
+
+    uint64_t pa_ram = mmu_translate(root, 0x40000000);
+    uint64_t pa_uart = mmu_translate(root, 0x09000000);                                      
+    uint64_t pa_unmapped = mmu_translate(root, 0x55000000);
+    
+
+    int test1_ok = (pa_ram == 0x40000000) && (pa_uart == 0x09000000) && (pa_unmapped == 0);
+
+    print_subtest("RAM/UART Translation & Unmapped Space Detection", test1_ok);
+    if (!test1_ok) overall_pass = 0;
+
+
+    //Non Identity mapping test
+    uart_puts("[2] Non-Identity Dynamic Mapping Test (VA != PA)\n");
+    void *phys_frame = pmm_alloc_page();
+    uint64_t test_va = 0x50000000ULL;
+
+    mmu_map_page(root, test_va, (uint64_t)phys_frame, MMU_FLAG_RAM);
+    
+
+    mmu_tlb_flush();
+
+    *(volatile uint64_t *)test_va = 0xFEEDC0FFEE123456ULL;
+    
+    uint64_t direct_read = *(volatile uint64_t *)phys_frame;
+    int test2_ok = (direct_read == 0xFEEDC0FFEE123456ULL);
+
+    *(volatile uint64_t *)phys_frame = 0xABCDEF0123456789ULL;
+    if (*(volatile uint64_t *)test_va != 0xABCDEF0123456789ULL) {
+        test2_ok = 0;
+    }
+    print_subtest("Bi-directional Translation Consistency (VA <-> PA)", test2_ok);
+    if (!test2_ok) overall_pass = 0;
+
+    // stress test for crossing 4KB page boundaries
+    uart_puts("[3] Multi-Page Boundary Stress Test\n");
+    void *multi_phys = pmm_alloc_pages(2);
+    uint64_t multi_va = 0x60000000ULL;
+
+    mmu_map_range(root, multi_va, (uint64_t)multi_phys, PAGE_SIZE * 2, MMU_FLAG_RAM);
+    mmu_tlb_flush();
+
+    volatile uint64_t *cross_boundary_ptr = (volatile uint64_t *)(multi_va + PAGE_SIZE - 4);
+    *cross_boundary_ptr = 0xAABBCCDDEEFF0011ULL;
+
+    int test3_ok = (*cross_boundary_ptr == 0xAABBCCDDEEFF0011ULL);
+    print_subtest("Cross-Page Boundary 64-bit Memory Access", test3_ok);
+    if (!test3_ok) overall_pass = 0;
+
+
+    //page remapping and TLB invalidation
+    uart_puts("[4] Dynamic Remapping & TLB Invalidation Test\n");
+    void *new_phys = pmm_alloc_page();
+    *(volatile uint64_t *)new_phys = 0x777788889999AAAAULL;
+
+    mmu_map_page(root, test_va, (uint64_t)new_phys, MMU_FLAG_RAM);
+    mmu_tlb_flush();
+
+    int test4_ok = (*(volatile uint64_t *)test_va == 0x777788889999AAAAULL);
+    print_subtest("TLB Flush and Remapped Page Visibility", test4_ok);
+    if (!test4_ok) overall_pass = 0;
+
+
+    //resource deallocation and cleanup
+    pmm_free_page(phys_frame);
+    pmm_free_pages(multi_phys, 2);
+    pmm_free_page(new_phys);
+
+    uart_puts("-------------------------------------------------------\n");
+    if (overall_pass) {
+        uart_puts("[TEST] [PASS] ALL MMU & PAGING TESTS COMPLETED SUCCESSFULLY!\n");
+    } else {
+        uart_puts("[TEST] [FAIL] MMU UNIT TESTS FAILED!\n");
+    }
+    uart_puts("=======================================================\n\n");
+
+}
+-e 
+
+
+=== ./pmm/pmm.c ===
+#include "pmm.h"
+#include "uart.h"
+#include <stddef.h>
+#include "memory_layout.h"
+
+
+extern char __kernel_end[];
+
+extern char __user_image_start[];
+extern char __user_image_end[];
+
+static uint64_t *bitmap = 0;
+static uint64_t total_pages = 0;
+static uint64_t bitmap_total_words = 0;
+static uint64_t usable_start_addr = 0;
+
+static inline void bitmap_set(uint64_t page_idx){
+    bitmap[page_idx/64] |= (1ULL << (page_idx % 64));
+}
+
+static inline void bitmap_clear(uint64_t page_idx){
+    bitmap[page_idx/64] &= ~(1ULL << (page_idx % 64));
+}
+
+static inline int bitmap_test(uint64_t page_idx){
+    return (bitmap[page_idx / 64] & (1ULL <<(page_idx % 64))) != 0; // it is in there = 1, if not =0
+}
+
+static void pmm_memzero(void *dst, size_t size){
+    uint8_t *p = (uint8_t *)dst;
+    while (size--)
+    {
+        *p++ = 0;
+    }
+    
+}
+
+void pmm_init(void){
+    total_pages = (RAM_END - RAM_START) / PAGE_SIZE;
+
+    bitmap_total_words = (total_pages + 63) / 64;
+    uint64_t bitmap_size_bytes = bitmap_total_words * sizeof(uint64_t);
+
+    //locate bitmap -> kernel_end
+    bitmap = (uint64_t *)(((uint64_t)__kernel_end + 7) & ~7ULL);
+    
+    //set all bits in the bitmap to 1
+    for (uint64_t i = 0; i < bitmap_total_words; i++){
+        bitmap[i] = ~0ULL;
+    }
+
+    uint64_t free_start  = (uint64_t)bitmap + bitmap_size_bytes;
+    usable_start_addr = (free_start + PAGE_SIZE -1) & ~(PAGE_SIZE - 1);
+
+    uint64_t start_page_idx = (usable_start_addr - RAM_START) / PAGE_SIZE; //to get page num
+   
+    for(uint64_t i = start_page_idx; i<total_pages; i++){
+        bitmap_clear(i);
+    }
+    //user image pmm reserved
+    uint64_t user_start = ((uint64_t)__user_image_start & ~(PAGE_SIZE -1));
+    uint64_t user_end = ((uint64_t)__user_image_end + PAGE_SIZE -1) & ~(PAGE_SIZE -1);
+
+    if(user_start < RAM_END && user_end > RAM_START){
+        if(user_start < RAM_START)
+            user_start = RAM_START;
+        if(user_end > RAM_END)
+            user_end =RAM_END;
+
+        uint64_t first_page = (user_start - RAM_START) / PAGE_SIZE;
+        uint64_t last_page = (user_end - RAM_START) / PAGE_SIZE;
+        
+        for(uint64_t i =first_page; i <last_page; i++){
+            bitmap_set(i);
+        }
+    }
+    uart_puts("[PMM] User image pages reserved.\n");
+}
+
+void *pmm_alloc_pages(uint64_t count){
+    if (count == 0) return 0;
+
+    uint64_t start_page_idx = (usable_start_addr - RAM_START) / PAGE_SIZE;
+    size_t found_count = 0;
+    uint64_t found_start_idx = 0;
+
+    for(uint64_t i = start_page_idx ; i < total_pages ; i++){
+        if(!bitmap_test(i)){//bitmap is empty(not allocated)
+            if(found_count == 0){
+                found_start_idx = i;
+            }
+            found_count++;
+            
+            if(found_count == count){ //allocation is done
+                for(uint64_t j = found_start_idx; j<found_start_idx + count ;j++){
+                    bitmap_set(j);
+                }
+                void *addr = (void *)(RAM_START + (found_start_idx * PAGE_SIZE));
+                pmm_memzero(addr, count * PAGE_SIZE);
+                return addr; //return start_allocation addr
+            }
+        }
+        else{//restart to find contiguous memory
+            found_count =0;
+        }
+    }        
+    return 0;
+}
+
+
+void *pmm_alloc_page(void){
+    return pmm_alloc_pages(1);
+}
+
+
+void pmm_free_pages(void *ptr, size_t count){
+    uint64_t addr = (uint64_t)ptr;
+
+    if(ptr == 0 || addr < usable_start_addr || addr >= RAM_END || (addr & (PAGE_SIZE - 1)) !=0){
+        return;
+    }
+
+    uint64_t page_idx = (addr - RAM_START) / PAGE_SIZE;
+    for(size_t i = 0; i<count ; i++){
+        if((page_idx + i) < total_pages){
+            bitmap_clear(page_idx + i);
+        }
+    }
+}
+
+void pmm_free_page(void *ptr){
+    return pmm_free_pages(ptr, 1);
+}
+
+uint64_t pmm_get_free_pages(void){
+    uint64_t free_cnt = 0;
+    uint64_t start_page_idx = (usable_start_addr - RAM_START) / PAGE_SIZE;
+    for(uint64_t i =start_page_idx; i < total_pages; i++){
+        if(!bitmap_test(i)){
+            free_cnt++;
+        }
+    }
+    return free_cnt;
+}
+
+-e 
+
+
+=== ./pmm/pmm.h ===
+#ifndef PMM_H
+#define PMM_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+#include "memory_layout.h"
+
+void pmm_init(void);
+void *pmm_alloc_page(void);
+void *pmm_alloc_pages(size_t count);
+void pmm_free_page(void *ptr);
+void pmm_free_pages(void *ptr, size_t count);
+
+uint64_t pmm_get_free_pages(void);
+
+#endif-e 
+
+
+=== ./heap/heap.c ===
+#include "heap.h"
+#include "pmm.h"
+#include "uart.h"
+
+static block_header_t *heap_start = 0;
+
+#define INITIAL_HEAP_PAGES 4
+
+void heap_init(void){
+    void *initial_mem = pmm_alloc_pages(INITIAL_HEAP_PAGES);
+    if(!initial_mem){
+        uart_puts("[HEAP ERROR] Failed to allocate physical memory for Heap!\n");
+        return;
+    }
+
+    heap_start = (block_header_t *)initial_mem;
+    heap_start->size = (INITIAL_HEAP_PAGES * PAGE_SIZE) - HEADER_SIZE;
+    heap_start->is_free = 1;
+    heap_start->next = 0;
+}
+
+
+void *kmalloc(size_t size){
+    if(size == 0) return 0;
+
+    size_t aligned_size = ALIGN_UP16(size);//aligned 16bytes
+    block_header_t *curr = heap_start;
+
+    while(curr){
+        if(curr->is_free && (curr->size) >= aligned_size){
+            if((curr->size) >= aligned_size + HEADER_SIZE + HEAP_ALIGNMENT){
+                block_header_t *new_block = (block_header_t *)((uint8_t *)curr + HEADER_SIZE + aligned_size);
+                new_block->size = curr->size - aligned_size - HEADER_SIZE;
+                new_block->is_free = 1;
+                new_block->next = curr->next;
+
+                curr->size = aligned_size;
+                curr->next = new_block;
+            }
+            curr->is_free = 0;
+
+            return (void *)((uint8_t *)curr + HEADER_SIZE);
+        }
+        curr = curr->next;
+    }
+
+    size_t pages_needed = (aligned_size + HEADER_SIZE + PAGE_SIZE - 1) / PAGE_SIZE;
+    void *new_pages = pmm_alloc_pages(pages_needed);
+    if(!new_pages){
+        uart_puts("[HEAP ERROR] Out of Memory in kmalloc!\n");
+        return 0;
+    }
+
+    block_header_t *expanded_block = (block_header_t *)new_pages;
+    expanded_block->size = (pages_needed * PAGE_SIZE) - HEADER_SIZE;
+    expanded_block->is_free=0;
+    expanded_block->next = 0;
+
+    curr = heap_start;
+    while (curr->next)
+    {
+        curr = curr->next;
+    }
+    curr->next = expanded_block;
+
+    return (void *)((uint8_t *)expanded_block + HEADER_SIZE);
+}
+
+void kfree(void *ptr){
+    if(!ptr) return;
+
+    block_header_t *header = (block_header_t *)((uint8_t *)ptr - HEADER_SIZE);
+    header->is_free = 1;
+
+    block_header_t *curr = heap_start;
+    while(curr && curr->next){
+        if(curr->is_free && curr->next->is_free){
+            if((uint8_t *)curr + HEADER_SIZE + curr->size == (uint8_t *)curr->next){
+                curr->size += HEADER_SIZE + curr->next->size;
+                curr->next = curr->next->next;
+                continue;
+            }
+        }
+        curr = curr->next;
+    }
+
+}-e 
+
+
+=== ./heap/heap.h ===
+#ifndef HEAP_H
+#define HEAP_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+#define HEAP_ALIGNMENT 16
+#define ALIGN_UP16(size) (((size) + (HEAP_ALIGNMENT - 1)) & ~(HEAP_ALIGNMENT - 1))
+
+typedef struct block_header{
+    size_t size;
+    int is_free;
+    struct block_header *next;
+    uint64_t padding;
+} block_header_t;
+
+#define HEADER_SIZE (sizeof(block_header_t))
+
+void heap_init(void);
+void *kmalloc(size_t size);
+void kfree(void *ptr);
+
+#endif-e 
+
+
+=== ./gic/gic.c ===
+#include "gic.h"
+
+
+//32bits MMIO memory access helper
+static inline void mmio_write32(uint64_t addr, uint32_t val){
+    *(volatile uint32_t*)addr = val;
+}
+
+static inline uint32_t mmio_read32(uint64_t addr){
+    return *(volatile uint32_t*)addr;
+}
+
+//8bits MMIO memory acceess helper to set priority
+static inline void mmio_write8(uint64_t addr, uint8_t val){
+    *(volatile uint8_t *)addr = val;
+}
+
+void gic_init(void){
+    //GICD disable for setting
+    mmio_write32(GICD_BASE + GICD_CTLR, 0);
+
+    //disable all of the Interrupt
+    for(int i=0;i<4;i++){
+        mmio_write32(GICD_BASE + GICD_ICENABLER + (i * 4), 0xFFFFFFFF);
+    }
+
+    for(int i=0;i<4;i++){
+        mmio_write32(GICD_BASE + GICD_IGROUPR + (i * 4), 0xFFFFFFFF);
+    }
+
+    //enable distributor
+    mmio_write32(GICD_BASE + GICD_CTLR, 0x3);
+
+    //cpu interface priority
+    mmio_write32(GICC_BASE + GICC_PMR, 0xFF);
+
+    //cpu interface enable
+    mmio_write32(GICC_BASE + GICC_CTLR, 0x7);
+}
+
+void gic_enable_interrupt(uint32_t irq_id){
+    //Set prority
+    //0x80 => middle priority
+    uint32_t prio_reg = GICD_BASE + GICD_IPRIORITYR + (irq_id & ~0x3U);
+    uint32_t shift = (irq_id % 4) * 8;
+    uint32_t val = mmio_read32(prio_reg);
+    val &= ~(0xFFU << shift);
+    val |= (0x80U << shift);
+    mmio_write32(prio_reg, val);
+
+    if(irq_id >=32){
+        mmio_write8(GICD_BASE + GICD_ITARGETSR + irq_id, 0x01);
+    }
+
+    //IRQ enable
+    uint32_t reg_idx = irq_id / 32;
+    uint32_t bit_offset = irq_id % 32;
+    mmio_write32(GICD_BASE + GICD_ISENABLER + (reg_idx * 4), (1U << bit_offset));
+}
+
+//If interrupt occured > IRQ Num check
+uint32_t gic_acknowledge_irq(void){
+    return mmio_read32(GICC_BASE + GICC_IAR) & 0x3FF;
+}
+
+//End of Interrupt
+void gic_end_of_irq(uint32_t irq_id){
+    mmio_write32(GICC_BASE + GICC_EOIR, irq_id);
+}
+
+
+
+-e 
+
+
+=== ./gic/gic.h ===
+#ifndef GIC_H
+#define GIC_H
+
+#include <stdint.h>
+
+#define GICD_BASE 0x08000000ULL //Distributor base addr
+#define GICC_BASE 0x08010000ULL //CPU interface base addr
+
+// GICD(Distributor) register offset
+#define GICD_CTLR       0x000   //Distributor Control
+#define GICD_TYPER      0x004   //Controller Type
+#define GICD_IGROUPR    0x080   //Interrupt Group Register
+#define GICD_ISENABLER  0x100   //Interrupt Set-enable
+#define GICD_ICENABLER  0x180   //Interrupt Clear-enable
+#define GICD_IPRIORITYR 0x400   //Interrupt Priority
+#define GICD_ITARGETSR  0x800   //Interrupt Targets
+
+// GICC(CPU Interface) register offset
+#define GICC_CTLR       0x0000  //CPU Interface Control
+#define GICC_PMR        0x0004  //Interrupt Priority Mask
+#define GICC_IAR        0x000C  //Interrupt Acknowledge
+#define GICC_EOIR       0x0010  //End of Interrupt
+
+//SYS Interrupt Num
+#define IRQ_TIMER_PHYS_NS   30  //ARM Generic Timer Non-Secure Physical IRQ(PPI 14)
+
+void gic_init(void);
+void gic_enable_interrupt(uint32_t irq_id);
+uint32_t gic_acknowledge_irq(void);
+void gic_end_of_irq(uint32_t irq_id);
+
+
+#endif-e 
+
+
+=== ./.git/FETCH_HEAD ===
+b9680b00f6006bd4174b1e098a7f1748ed429324		branch 'main' of https://github.com/moonhs18/myos
+234fc15b15d1ffa6754145ce9852c803c18ef9b8	not-for-merge	branch 'sched' of https://github.com/moonhs18/myos
+-e 
+
+
+=== ./.git/HEAD ===
+ref: refs/heads/vfs
+-e 
+
+
+=== ./.git/packed-refs ===
+# pack-refs with: peeled fully-peeled sorted 
+929541d3b2c99d970625dee378ad58fec69fe54e refs/remotes/origin/main
+-e 
+
+
+=== ./.git/config ===
+[core]
+	repositoryformatversion = 0
+	filemode = true
+	bare = false
+	logallrefupdates = true
+[remote "origin"]
+	url = https://github.com/moonhs18/myos.git
+	fetch = +refs/heads/*:refs/remotes/origin/*
+[branch "main"]
+	remote = origin
+	merge = refs/heads/main
+	vscode-merge-base = origin/main
+[branch "vfs"]
+	vscode-merge-base = origin/main
+	remote = origin
+	merge = refs/heads/vfs
+-e 
+
+
+=== ./.git/COMMIT_EDITMSG ===
+fix complement syscall.h
+-e 
+
+
+=== ./.git/ORIG_HEAD ===
+b9680b00f6006bd4174b1e098a7f1748ed429324
+-e 
+
+
+=== ./.git/index ===
+DIRC      Cj�l��j�l��  0    ��  �  �  H�LnS��2���s� �/r�� Makefile  j��	_��j��	_��  0  ��  ��  �  �  Bz�l ��b?8!)&��Jr�4 	README.md j����Pj����P  0  �  ��  �  �  1�@�/Yګ��ht�'P � boot/boot.s       j��&0��ij��&0��i  0  3  ��  �  �  ���qW�OH�n�T��z��t boot/vector.s     j��8I3Hj��8I3H  0  �
+  ��  �  �  X�x �������?�K���:� build/boot/boot.o j��9G�1j��9G�1  0  ��  ��  �  �  ��r�%R������Y-� build/boot/vector.o       j�����j�����  0  ��  ��  �  �  & `7����;���]���@ߌ build/gic/gic.o   j���#-j���#-  0  ��  ��  �  �  !�an��9��K���R8��9&� build/heap/heap.o j��;E@j��;E@  0  �  ��  �  � (��$���&0�ʪ��H�=�~� build/kernel.elf  j��:p$j��:p$  0  ��  ��  �  �  I�$T�@	�+˫�z{�� build/kernel/exception.o  j��1�9cj��1�9c  0  ��  ��  �  �  )0v_#�႘��-|!
+y}� build/kernel/kernel.o     j����j����  0  ��  ��  �  �  U��fod *P'�k��k� build/mmu/mmu.o   j��9�9�j��9�9�  0  ��  ��  �  �  Php3y��z�mG�EX�e�w> build/mmu/mmu_enable.o    j��	��j��	��  0  ��  ��  �  �  <`o�!<2���m��:	��\ build/pmm/pmm.o   j��*r�j��*r�  0  ��  ��  �  �  K�`�c�Wl���e�~�ڇ8 build/sched/sched.o       j��:�<�j��:�<�  0  �  ��  �  �  p��灬��nUT|��-�D��3 build/sched/switch.o      j��#�1�j��#�1�  0  �  ��  �  �  38����N�X�?F��|{h�h�&K build/syscall/syscall.o   j��%�jj��%�j  0  �  ��  �  �  ȭA+s�B����̶��m�K� build/test/test_exception.o       j��*���j��*���  0  �  ��  �  �  $X�(=�%�֠������D� build/test/test_heap.o    j��.�	�j��.�	�  0  �  ��  �  �  JB��s9ohD�N�s�q�� build/test/test_mmu.o     j��(^D�j��(^D�  0  �  ��  �  �  $��y����)V��t<�T]��� build/test/test_pmm.o     j��4Nw�j��4Nw�  0  �  ��  �  �  (ذ��qF�[�:��E�_�� build/test/test_sched.o   j��0�rj��0�r  0  �  ��  �  �  hF�k]�>A�%�4��,�v]0 build/test/test_timer.o   j��7���j��7���  0  �	  ��  �  �  >p�F����ʥ��"Z�m�~ build/test/test_user.o    j��sVj��sV  0  ��  ��  �  �  �	��'��b�Z��L���6{l build/timer/timer.o       j����j����  0  ��  ��  �  �  �!��F�,��	Y:��� build/uart/uart.o j���tj���t  0  �k  ��  �  �  �U���)_��	G]R�C�6�K docs/implementation.md    j�-j�Gj�-j�G  0 Z  ��  �  �  |C3�R)���)A=9`�B 	gic/gic.c j�-j�Gj�-j�G  0 [  ��  �  �  H�k�,ٌ��7���J��) 	gic/gic.h j�2fmWj�2fmW  0  D  ��  �  �  	���x���R�'�кVЭ� heap/heap.c       j�
+�!�?j�
+�!�?  0  E  ��  �  �  ��A��7;~�s���c����" heap/heap.h       j�k�!��j�k�!��  0  �  ��  �  �  ���|���|� �I�R� kernel/exception.c        j�-j�Rj�-j�R  0  �  ��  �  �   ts5�0�9;os00����x� kernel/exception.h        j��
+5���j��
+5���  0  �  ��  �  �  �"�jV����"X��T�0�� kernel/kernel.c   j����4�j����4�  0  �  ��  �  �  �@�� ��k5���j� kernel/memory_layout.h    j�i���0j�i���0  0  �  ��  �  �  c��y��O���g�ana�u 	linker.ld j�dش9j�dش9  0  �C  ��  �  �  |�XVJԎo{�VP��֠?� 	mmu/mmu.c j�d2\�j�d2\�  0   ��  �  �  	��Dy���H^3ȕĪ{�=i 	mmu/mmu.h j��F-cYj��F-cY  0 '  ��  �  �  i���ߓ:Wa*-g
+� <�� mmu/mmu_enable.s  j��E��j��E��  0  �  ��  �  �  ▿%���J���.�_QD: 
+output.txt        j�\�4��j�\�4��  0  ��  ��  �  �  �t�h[�*2w����#�H� 	pmm/pmm.c j�Y�;E�j�Y�;E�  0  ��  ��  �  �  0qۍ̅�̎�ҹ��Fx�� 	pmm/pmm.h j��%���j��%���  0   ��  �  �  �I-Ǐ�3U�������� ���1 sched/sched.c     j��Fʍj��Fʍ  0   ��  �  �  ����{[[����������Ek sched/sched.h     j��Q.��j��Q.��  0 !  ��  �  �  ��-�����w6�\�&ZLkO sched/switch.s    j�nPt�j�nPt�  0 "  ��  �  �  \:kOg�E�絤���
+:�� sched/task.h      j�qR8!~j�qR8!~  0  �A  ��  �  �  ��j|�(:ϱ��r���$X� syscall/syscall.c j�]�	;�Ej�]�	;�E  0  �  ��  �  �  	�~�H�W|:�!��'�1,�� syscall/syscall.h j���:7�j���:7�  0  �  ��  �  �  @�8���畨lS��Q��,�a test/test.h       j�,���Qj�,���Q  0  �  ��  �  �  ���8�m�j(�0����4�� test/test_exception.c     j��	'��j��	'��  0  X  ��  �  �  Vɏ.�JXQ1ώP��cȅ$D�r test/test_heap.c  j���e��j���e��  0 -  ��  �  �  jC�G�_����F� @ݿ�� test/test_mmu.c   j�ڔ.?��j�ڔ.?��  0  �q  ��  �  �  a��-��:��˼k��ɋ� test/test_pmm.c   j��J3��j��J3��  0 #  ��  �  �  ��,[��Kl�Sݚ_�Dj�| test/test_sched.c j�-j;#^j�-j;#^  0 p  ��  �  �  ��'/�{�L����"�^c�y�	 test/test_timer.c j�d	Kj�d	K  0  �  ��  �  �  	��1�p�v;b�;����sS test/test_user.c  j�n
+Qi@j�n
+Qi@  0  �  ��  �  �    �⛲��CK�)�wZ���S� test/test_vfs.c   j�-j;#^j�-j;#^  0 n  ��  �  �  �y���5�ʕ����5gy���� timer/timer.c     j�-j;#^j�-j;#^  0 p  ��  �  �   �9@��5�a���	x���m� timer/timer.h     j�ߔbH�j�ߔbH�  0  �l  ��  �  �  ����,C�MXY5�z�h����B� uart/uart.c       j��Z4�x}j��Z4�x}  0  �g  ��  �  �  >�$
+`����4�JrH���;=/� uart/uart.h       j�mdV/<j�mdV/<  0  �  ��  �  �  ���O��e�W��Q*d��я� vfs/devfs.c       j�b�+j�b�+  0  ��  ��  �  �   Q�7�}�da[MB-z+��=��M� vfs/devfs.h       j�a�43j�a�43  0  �  ��  �  �  q4척'?<���qA$���/ vfs/ramfs.c       j�S0�Xj�S0�X  0  ��  ��  �  �   �{�uWm�?�C���L���e� vfs/ramfs.h       j��$>�j��$>�  0  �  ��  �  �  ��^��n��E��Φi��r� 	vfs/vfs.c j�R�1�2�j�R�1�2�  0  �  ��  �  �  �����Q����n��~�J� 	vfs/vfs.h TREE  � 67 14
+�膭��b�<��S�;�D7�gic 2 0
+f���JٸL��C����hJPݓmmu 3 0
+�,��(EA��a��j�����pmm 2 0
+7&vet��i�)Q951Jޯ�P�vfs 6 0
+`���,��濤M��b�7i�boot 2 0
+�X����5z�It;�x�docs 1 0
+��_r�\ۺ�����ꄤx��heap 2 0
+�7���W�;����rH́w'test 9 0
+��̃�U��V1���V��_��uart 2 0
+:���x��eq|�D/j�[�build 22 11
+��n^���j��8 �=i�nKgic 1 0
+�ǐO�?3���ɛ�����`,�mmu 2 0
+#!#?��FWPی1���裒pmm 1 0
+'����cN��sl&�J&��boot 2 0
+:��72��v]!�G�5a=�heap 1 0
+�v/E��PC{gR�b8test 7 0
+���^ś��^~�ȗ����3�uart 1 0
+����[{�Dg|W��r�|	sched 2 0
+���ܑ�u�wU�gvVGI�timer 1 0
+�S���[�g�� p��h�kernel 2 0
+����������u��C%--�syscall 1 0
+�:����F�*4�;kK����sched 4 0
+�-q�MN.}+n~^it*�3Htimer 2 0
+���{ct�ך<Y16���"�Dkernel 4 0
+_�@(�����`T�$k*��9syscall 2 0
+�
+�
+������Ae[Áe�O�8���2`���-e 
+
+
+=== ./.git/description ===
+Unnamed repository; edit this file 'description' to name the repository.
+-e 
+
+
+=== ./uart/uart.c ===
+#include "uart.h"
+
+void uart_init(void){
+    *UARTCR = 0x0;
+
+    /*  Baudrate setting base 115200 - 24MHz
+        IBRD = 24000000 / (16 * 115200) = 13.0208 -> 13
+        FBRD = 0.0208 * 64 = 1.33 -> 1 */
+    *UARTIBRD = 13;
+    *UARTFBRD = 1;
+
+    *UARTLCR_H = (1<<4) | (3<<5);
+
+    *UARTCR = (1<<0) | (1<<8) | (1<<9);
+}
+
+void uart_putc(char c){
+    while (*UARTFR & FR_TXFF);
+
+    if(c=='\n'){
+        *UARTDR = '\r';
+        while (*UARTFR & FR_TXFF);
+    }
+    *UARTDR = (uint32_t)c;
+}
+
+void uart_puts(const char *s){
+    while(*s){
+        uart_putc(*s++);
+    }
+}
+
+void uart_put_hex(uint64_t val){
+    const char hex_chars[] = "0123456789ABCDEF";
+    uart_puts("0x");
+    for(int i = 60; i >= 0; i -= 4){
+        uart_putc(hex_chars[(val >> i) & 0xF]);
+    }
+}
+
+-e 
+
+
+=== ./uart/uart.h ===
+#ifndef UART_H
+#define UART_H
+
+#include <stdint.h>
+
+#define UART0_BASE 0x09000000
+
+#define UARTDR      ((volatile uint32_t *)(UART0_BASE + 0x00)) //Data Register for rx tx
+#define UARTFR      ((volatile uint32_t *)(UART0_BASE + 0x18)) //Flag Register for state flag
+#define UARTIBRD    ((volatile uint32_t *)(UART0_BASE + 0x24)) //Interger Baud Rate Divisior
+#define UARTFBRD    ((volatile uint32_t *)(UART0_BASE + 0x28)) //Fractional Baud Rate Divisior
+#define UARTLCR_H   ((volatile uint32_t *)(UART0_BASE + 0x2C)) //Line Control Register
+#define UARTCR      ((volatile uint32_t *)(UART0_BASE + 0x30)) //Control Register
+
+#define FR_TXFF (1<<5) //Transmit FIFO Full
+#define FR_RXFE (1<<4) //Receive FIFO Empty
+
+void uart_init(void);
+void uart_putc(char c);
+void uart_puts(const char *s);
+void uart_put_hex(uint64_t val);
+
+#endif-e 
+
+
+=== ./docs/implementation.md ===
+[Phase 1: Boot & I/O] ──► [Phase 2: Exception] ──► [Phase 3: Memory (MMU)]
+(부트/스택/UART) [완료]    (벡터테이블/패닉덤프) [완료] (PMM / kmalloc / 페이징) [완료]
+                                                              │
+                                                              ▼
+[Phase 6: User Mode]  ◄── [Phase 5: Scheduling] ◄── [Phase 4: Interrupt]
+(EL0 / SVC 시스템콜)[완료]       (PCB / 선점형 스케줄러)[완료]   (GIC / ARM Generic Timer) [완료]
+        │
+        ▼
+[Phase 7: Storage & VFS] ──► [Phase 8: Shell & Apps]
+(RamFS / Initramfs / VFS)     (ELF 로더 / Mini C Lib / 쉘)-e 
+
+
+=== ./mmu/mmu.c ===
+#include "mmu.h"
+#include "pmm.h"
+#include "uart.h"
+
+static uint64_t *l0_root = 0;
+
+
+static void mmu_memzero(void *dst, size_t size){
+    uint8_t*p = (uint8_t *)dst;
+    while (size--)
+    {
+        *p++=0;
+    }
+}
+
+
+uint64_t *mmu_get_root_table(void){
+    return l0_root;
+}
+
+void mmu_tlb_flush(void){
+    asm volatile(
+        "dsb ish\n"
+        "tlbi vmalle1\n"
+        "dsb ish\n"
+        "isb\n"
+        ::: "memory"
+    );
+}
+
+uint64_t mmu_translate(uint64_t *l0_table, uint64_t va){
+    if(!l0_table) return 0;
+
+    uint64_t l0_entry = l0_table[L0_INDEX(va)];
+    if(!(l0_entry & 0x1)) return 0;
+
+    uint64_t *l1_table = (uint64_t *)(l0_entry & 0x0000FFFFFFFFF000ULL);
+    uint64_t l1_entry = l1_table[L1_INDEX(va)];
+    if(!(l1_entry & 0x1)) return 0;    
+
+    uint64_t *l2_table = (uint64_t *)(l1_entry & 0x0000FFFFFFFFF000ULL);
+    uint64_t l2_entry = l2_table[L2_INDEX(va)];
+    if(!(l2_entry & 0x1)) return 0;
+    
+    uint64_t *l3_table = (uint64_t *)(l2_entry & 0x0000FFFFFFFFF000ULL);
+    uint64_t l3_entry = l3_table[L3_INDEX(va)];
+    if(!(l3_entry & 0x1)) return 0;
+
+    return (l3_entry & 0x0000FFFFFFFFF000ULL) | (va & 0xFFFULL);
+}
+
+static uint64_t* get_or_create_table(uint64_t *parent_table, uint64_t index){
+    uint64_t entry = parent_table[index];
+
+    if(entry & 0x1){// If page aleady exists >>  return addr
+        return (uint64_t *)(entry & 0x0000FFFFFFFFF000ULL);
+    }
+
+    void *new_table = pmm_alloc_page();
+    if(!new_table){
+        uart_puts("[MMU ERROR] Out of Memory while allocting page table!\n");
+        return 0;
+    }
+
+    mmu_memzero(new_table, PAGE_SIZE);
+
+    parent_table[index] = ((uint64_t)new_table & 0x0000FFFFFFFFF000ULL) | MMU_DESCRIPTOR_TABLE;
+    return (uint64_t *)new_table;
+}
+
+void mmu_map_page(uint64_t *l0_table, uint64_t va, uint64_t pa, uint64_t flags){
+    uint64_t l0_idx = L0_INDEX(va);
+    uint64_t l1_idx = L1_INDEX(va);
+    uint64_t l2_idx = L2_INDEX(va);
+    uint64_t l3_idx = L3_INDEX(va);
+
+    uint64_t *l1_table = get_or_create_table(l0_table, l0_idx);
+    uint64_t *l2_table = get_or_create_table(l1_table, l1_idx);
+    uint64_t *l3_table = get_or_create_table(l2_table, l2_idx);
+
+    l3_table[l3_idx] = (pa & 0x0000FFFFFFFFF000ULL) | flags;
+}
+
+void mmu_map_range(uint64_t *l0_table, uint64_t va_start, uint64_t pa_start, size_t size, uint64_t flags){    
+    uint64_t va = va_start & ~0xFFFULL;
+    uint64_t pa = pa_start & ~0xFFFULL;
+    size_t pages = (size + PAGE_SIZE -1) / PAGE_SIZE;
+
+    for(size_t i = 0; i < pages; i++){
+        mmu_map_page(l0_table, va, pa, flags);
+        va += PAGE_SIZE;
+        pa += PAGE_SIZE;
+    }
+}
+
+void mmu_init(void){
+    l0_root = (uint64_t *)pmm_alloc_page();
+    
+    if(!l0_root){
+        uart_puts("[MMU ERROR] Failed to allocate L0 Root page Table!\n");
+        return;
+    }
+
+    mmu_memzero(l0_root, PAGE_SIZE);
+    
+    //UART MMIO mapping
+    mmu_map_range(l0_root, 0x09000000, 0x09000000, 0x10000, MMU_FLAG_DEVICE);
+    
+    ////GICv2 mapping
+    mmu_map_range(l0_root, 0x08000000, 0x08000000, 0x20000, MMU_FLAG_DEVICE);
+
+    //kernel ram EL1 only 
+    mmu_map_range(l0_root, RAM_START, RAM_START, RAM_SIZE, MMU_FLAG_RAM);
+
+    //user image
+    extern char __user_text_start[];
+    extern char __user_text_end[];
+    
+    extern char __user_rodata_start[];
+    extern char __user_rodata_end[];
+    
+    extern char __user_data_start[];
+    extern char __user_data_end[];
+    
+    uint64_t user_text_start = (uint64_t)__user_text_start;
+    uint64_t user_text_size = (uint64_t)__user_text_end - user_text_start;
+
+    if(user_text_size){
+        //user code
+        mmu_map_range(l0_root, user_text_start, user_text_start,user_text_size, MMU_FLAG_USER_CODE);   
+    }
+
+    
+
+
+    uint64_t user_rodata_start = (uint64_t)__user_rodata_start;
+    uint64_t user_rodata_size = (uint64_t)__user_rodata_end - user_rodata_start;    
+
+   if(user_rodata_size){
+        //user RO data
+        mmu_map_range(l0_root,user_rodata_start, user_rodata_start, user_rodata_size, MMU_FLAG_USER_RODATA);
+    }
+
+    uint64_t user_data_start = (uint64_t)__user_data_start;
+    uint64_t user_data_size = (uint64_t)__user_data_end - user_data_start;    
+
+   if(user_data_size){
+        //user RO data
+        mmu_map_range(l0_root,user_data_start, user_data_start, user_data_size, MMU_FLAG_USER_DATA);
+    }
+
+
+
+
+    uart_puts("[MMU] Before enable\n");
+    //set system register and run mmu
+    arm64_mmu_enable((uint64_t)l0_root);
+
+    uart_puts("[MMU] After enable\n");
+    
+}-e 
+
+
+=== ./mmu/mmu.h ===
+#ifndef MMU_H
+#define MMU_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+#include "memory_layout.h"
+
+#define PAGE_SHIFT      12
+#define TABLE_ENTRIES   512
+#define VA_MASK_9BIT    0x1FF //0b 0001 1111 1111
+
+//macro to extract page table index from VA
+#define L0_INDEX(va)    (((va) >> 39) & VA_MASK_9BIT)
+#define L1_INDEX(va)    (((va) >> 30) & VA_MASK_9BIT)
+#define L2_INDEX(va)    (((va) >> 21) & VA_MASK_9BIT)
+#define L3_INDEX(va)    (((va) >> 12) & VA_MASK_9BIT)
+
+#define MMU_DESCRIPTOR_TABLE    0x3ULL //table descriptor
+#define MMU_DESCRIPTOR_PAGE     0x3ULL //valid 4KB page
+
+
+#define MMU_ATTR_DEVICE_INDEX   (0ULL << 2) //Attr 0(Device - nGnRnE)
+#define MMU_ATTR_NORMAL_INDEX   (1ULL << 2) //Attr 1(Normal Cachable)
+#define MMU_ACCESS_FLAG         (1ULL << 10) //bit[10] = 1
+#define MMU_SH_INNER_SHAREABLE  (3ULL << 8) //bit[9:8] = 0b11
+
+#define MMU_AP_KERNEL_RW        (0ULL << 6) //bit[7:6] = 0b00 (EL1 RW / EL0 None)
+#define MMU_AP_USER_RW          (1ULL << 6) //bit[7:6] = 0b01 (EL1 RW / EL0 RW)
+#define MMU_AP_USER_RO          (3ULL << 6) //bit[7:6] = 0b11 (EL1 RO / EL0 RO)
+
+#define MMU_UXN                 (1ULL <<54)
+#define MMU_PXN                 (1ULL <<53)
+
+#define MMU_FLAG_RAM            (MMU_DESCRIPTOR_PAGE | MMU_ATTR_NORMAL_INDEX | \
+                                MMU_ACCESS_FLAG | MMU_SH_INNER_SHAREABLE | MMU_AP_KERNEL_RW)
+
+
+#define MMU_FLAG_USER_CODE      (MMU_DESCRIPTOR_PAGE | MMU_ATTR_NORMAL_INDEX | \
+                                MMU_ACCESS_FLAG | MMU_SH_INNER_SHAREABLE | MMU_AP_USER_RO)
+
+#define MMU_FLAG_USER_RODATA    (MMU_DESCRIPTOR_PAGE | MMU_ATTR_NORMAL_INDEX | \
+                                MMU_ACCESS_FLAG | MMU_SH_INNER_SHAREABLE | MMU_AP_USER_RO | MMU_UXN | MMU_PXN)
+
+
+
+#define MMU_FLAG_USER_DATA    (MMU_DESCRIPTOR_PAGE | MMU_ATTR_NORMAL_INDEX | \
+                                MMU_ACCESS_FLAG | MMU_SH_INNER_SHAREABLE | MMU_AP_USER_RW | MMU_UXN | MMU_PXN)
+
+
+#define MMU_FLAG_DEVICE         (MMU_DESCRIPTOR_PAGE | MMU_ATTR_DEVICE_INDEX | \
+                                MMU_ACCESS_FLAG | MMU_AP_KERNEL_RW | MMU_UXN | MMU_PXN)
+
+
+
+
+
+void mmu_init(void);
+
+void mmu_map_page(uint64_t *l0_table, uint64_t va, uint64_t pa, uint64_t flags);
+void mmu_map_range(uint64_t *l0_table, uint64_t va_start, uint64_t pa_start, size_t size, uint64_t flags);
+
+uint64_t *mmu_get_root_table(void);
+uint64_t mmu_translate(uint64_t *l0_table, uint64_t va);
+void mmu_tlb_flush(void);
+
+extern void arm64_mmu_enable(uint64_t l0_root);
+
+#endif-e 
+
+
+=== ./mmu/mmu_enable.s ===
+.section ".text"
+.global arm64_mmu_enable
+
+// void arm64_mmu_enable(uint64_t l0_table_pa);
+// x0 is the physical addr of the L0 table
+arm64_mmu_enable:
+    //set MAIR_EL1
+    //Attr 0 (bits[7:0]) = 0x00(device-nGnRnE)
+    //Attr 1 (bits[15:8]) = 0xFF(normal cachable)
+    ldr x1, =0x000000000000FF00
+    msr mair_el1, x1
+
+    //set TCR_EL1
+    // T0SZ = 16 (48-bit Virtual Address, Bits[5:0])
+    // IRGN0 = 0b01 (Inner WB-WA, Bits[9:8])
+    // ORGN0 = 0b01 (Outer WB-WA, Bits[11:10])
+    // SH0 = 0b11 (Inner Shareable, Bits[13:12])
+    // TG0 = 0b00 (4KB Granule, Bits[15:14])
+    // EPD1 = 1 (Disable TTBR1 walks for now, Bit 23)
+    // IPS = 0b010 (40-bit Physical Address space 1TB, Bits[34:32])
+    //ldr x2, =   ((16ULL << 0) | (1ULL << 8)  | (1ULL << 10) | (3ULL << 12) | (0ULL << 14) | (1ULL << 23) | (2ULL << 32))
+    ldr x2, =0x0000000280153510
+    msr tcr_el1, x2
+    isb
+
+
+    //set L0 root table addr in TTBR0_EL1 
+    msr ttbr0_el1, x0
+    isb
+
+    //invalid all tlb entries
+    dsb ish
+    tlbi vmalle1
+    dsb ish
+    isb
+
+    //modify SCTLR_EL1 to enable mmu, data cache, instruction cache
+    mrs x3, sctlr_el1
+    orr x3, x3, #(1 << 0)   //Bit 0 : MMU enable
+    bic x3, x3, #(1 << 2)   //Bit 2 : Data cache enable
+    bic x3, x3, #(1 << 12)  //Bit 12: Instruction cache enable
+    bic x3, x3, #(1 << 19) //Disable WXN
+    msr sctlr_el1, x3
+    isb
+
+    ret
+    
+
+
+-e 
+
+
+=== ./boot/vector.s ===
+.section ".text.vector"
+
+.macro ventry label
+    .align 7 //128bytes
+    b \label
+.endm
+
+.macro kernel_entry
+    sub sp, sp, #272
+    stp x0, x1, [sp, #16 * 0]
+    stp x2, x3, [sp, #16 * 1]
+    stp x4, x5, [sp, #16 * 2]
+    stp x6, x7, [sp, #16 * 3]
+    stp x8, x9, [sp, #16 * 4]
+    stp x10, x11, [sp, #16 * 5]
+    stp x12, x13, [sp, #16 * 6]
+    stp x14, x15, [sp, #16 * 7]
+    stp x16, x17, [sp, #16 * 8]
+    stp x18, x19, [sp, #16 * 9]
+    stp x20, x21, [sp, #16 * 10]
+    stp x22, x23, [sp, #16 * 11]
+    stp x24, x25, [sp, #16 * 12]
+    stp x26, x27, [sp, #16 * 13]
+    stp x28, x29, [sp, #16 * 14]
+
+    mrs x21, elr_el1
+    mrs x22, spsr_el1
+
+    stp x30, x21, [sp, #16 * 15]
+    str x22, [sp, #16 * 16]
+.endm
+
+.macro kernel_exit
+    ldr x22, [sp, #16 * 16]
+    ldp x30, x21, [sp, #16 * 15]
+    msr spsr_el1, x22
+    msr elr_el1, x21
+    
+    ldp x28, x29, [sp, #16 * 14]
+    ldp x26, x27, [sp, #16 * 13]
+    ldp x24, x25, [sp, #16 * 12]
+    ldp x22, x23, [sp, #16 * 11]
+    ldp x20, x21, [sp, #16 * 10]
+    ldp x18, x19, [sp, #16 * 9]
+    ldp x16, x17, [sp, #16 * 8]
+    ldp x12, x13, [sp, #16 * 6]
+    ldp x14, x15, [sp, #16 * 7]
+    ldp x10, x11, [sp, #16 * 5]
+    ldp x8, x9, [sp, #16 * 4]
+    ldp x6, x7, [sp, #16 * 3]
+    ldp x4, x5, [sp, #16 * 2]
+    ldp x2, x3, [sp, #16 * 1]
+    ldp x0, x1, [sp, #16 * 0]
+    
+    add sp, sp, #272
+    
+    eret
+.endm
+    
+.align 11
+.global exception_vector_table
+exception_vector_table:
+    // 1. current EL with SP0
+    ventry sync_invalid_el1t
+    ventry irq_invalid_el1t
+    ventry fiq_invalid_el1t
+    ventry serror_invalid_el1t
+
+    // 2. current EL with SPx
+    ventry el1_sync_entry // to implement, suffixed with _entry 
+    ventry el1_irq_entry  // to implement, suffixed with _entry
+    ventry fiq_invalid_el1h
+    ventry serror_invalid_el1h
+
+    // 3. current EL with AArch64
+    ventry lower_sync_entry //to implement, suffixed with _entry
+    ventry lower_irq_entry //to implement, suffixed with _entry
+    ventry fiq_invalid_lower
+    ventry serror_invalid_lower
+
+    // 4. current EL with AArch32
+    ventry sync_invalid_aarch32
+    ventry irq_invalid_aarch32
+    ventry fiq_invalid_aarch32
+    ventry serror_invalid_aarch32
+
+el1_sync_entry:
+    kernel_entry
+    mov x0, sp
+    mrs x1, esr_el1
+    mrs x2, far_el1
+    bl  handle_el1_sync
+    kernel_exit
+
+el1_irq_entry:
+    kernel_entry
+    bl  handle_el1_irq
+    kernel_exit
+
+lower_sync_entry:
+    kernel_entry
+    mov x0, sp
+    mrs x1, esr_el1
+    mrs x2, far_el1
+    bl handle_lower_sync
+    kernel_exit
+
+lower_irq_entry:
+    kernel_entry
+    bl handle_lower_irq
+    kernel_exit
+
+sync_invalid_el1t:
+irq_invalid_el1t:
+fiq_invalid_el1t:
+serror_invalid_el1t:
+fiq_invalid_el1h:
+serror_invalid_el1h:
+fiq_invalid_lower:
+serror_invalid_lower:
+sync_invalid_aarch32:
+irq_invalid_aarch32:
+fiq_invalid_aarch32:
+serror_invalid_aarch32:
+    kernel_entry
+    mov x0, sp
+    mrs x1, esr_el1
+    mrs x2, far_el1
+    bl handle_unknown_exception
+1:  wfe
+    b 1b
+
+
+
+-e 
+
+
+=== ./boot/boot.s ===
+.section ".text.boot"
+.global _start
+
+_start:
+	mrs x0, mpidr_el1
+	and x0, x0, #0xFF
+	cbz x0, el_setup
+
+hang:
+	wfe
+	b hang
+
+el_setup:
+	mrs x0, CurrentEL
+	lsr x0, x0, #2
+
+	cmp x0, #3
+	b.eq level_el3
+	cmp x0, #2
+	b.eq level_el2
+	b init_kernel_sp
+	
+level_el3:
+	ldr x1, =0x401
+	msr scr_el3, x1
+
+	mov x1, #0b00101
+	msr spsr_el3, x1
+	
+	adr x1, init_kernel_sp
+	msr elr_el3, x1
+	
+	eret
+
+level_el2:
+	ldr x1, =0x80000000
+	msr hcr_el2, x1
+
+	mov x1, #0b00101
+	msr spsr_el2, x1
+	
+	adr x1, init_kernel_sp
+	msr elr_el2, x1
+	
+	eret
+
+init_kernel_sp:
+	mov x0, #(3<<20) // fcu/neon disable		
+	msr cpacr_el1, x0
+	isb
+
+	ldr x0, = __stack_top
+	mov sp, x0
+
+	ldr x1, = __bss_start
+	ldr x2, = __bss_end
+
+clear_bss:
+	cmp x1, x2
+	b.ge enter_kernel
+	str xzr, [x1], #8
+	b clear_bss
+
+enter_kernel:
+	bl kernel_main
+system_halt:
+	wfi
+	b system_halt
+	-e 
+
+
+=== ./timer/timer.c ===
+#include "timer.h"
+#include "gic.h"
+#include "uart.h"
+
+static volatile uint64_t timer_ticks = 0;
+static uint64_t timer_interval = 0;
+
+static inline uint64_t read_cntfrq(void){
+    uint64_t val;
+    asm volatile("mrs %0, cntfrq_el0" : "=r"(val));
+    return val;
+}
+static inline void write_cntpfrq(uint64_t val){
+    asm volatile("msr cntfrq_el0, %0" : : "r"(val));
+}
+
+static inline void write_cntp_tval(uint64_t val){
+    asm volatile("msr cntp_tval_el0, %0" : : "r"(val) : "memory");
+}
+
+static inline uint64_t read_cntp_tval(void){
+    uint64_t val;
+    asm volatile("mrs %0, cntp_tval_el0" : "=r"(val));
+    return val;
+}
+
+static inline void write_cntp_ctl(uint64_t val){
+    asm volatile("msr cntp_ctl_el0, %0" : : "r"(val) : "memory");
+}
+
+static inline uint64_t read_cntp_ctl(void){
+    uint64_t val;
+    asm volatile("mrs %0, cntp_ctl_el0" : "=r"(val));
+    return val;
+}
+
+void timer_init(uint32_t target_hz){
+    if(target_hz == 0) target_hz = 100; //default = 100Hz(10ms)
+    
+    //Read the CPU physical timer frequency
+    uint64_t freq = read_cntfrq(); 
+
+    if (freq == 0){
+        freq = 62500000ULL;
+        write_cntpfrq(freq);
+    }
+    //Calculate the countdown value for a single interrupt
+    timer_interval = freq / target_hz;
+
+    //In GICv2 enable Num 30 Timer Interrupt
+    gic_enable_interrupt(IRQ_TIMER_PHYS_NS);
+
+    write_cntp_tval(timer_interval);
+    write_cntp_ctl(1);
+}
+
+void timer_handle_irq(void){
+    //if you wanna test it, uncomment the uart code below
+    //uart_puts("[TIMER IRQ] ENTER\n");
+    //uart_puts("[TIMER IRQ] ticks = ");
+    //uart_put_hex(timer_ticks);
+    //uart_puts("\n");
+
+    timer_ticks++;
+    //Reload the countdown timer for the next period
+    write_cntp_tval(timer_interval);
+}
+
+uint64_t timer_get_ticks(void){
+    return timer_ticks;
+}
+
+void timer_sleep_ticks(uint64_t count){
+    uint64_t start = timer_ticks;
+    while(timer_ticks - start < count){
+        asm volatile ("wfi"); // Wait for an interrupt 
+    }
+}
+
+
+
+
+-e 
+
+
+=== ./timer/timer.h ===
+#ifndef TIMER_H
+#define TIMER_H
+
+#include <stdint.h>
+
+void timer_init(uint32_t target_hz);
+void timer_handle_irq(void);
+uint64_t timer_get_ticks(void);
+void timer_sleep_ticks(uint64_t count);
+
+
+
+#endif-e 
+
+
+=== ./sched/switch.s ===
+.section ".text"
+.global cpu_switch_to
+.global task_entry_trampoline
+.global user_first_return
+
+// void cpu_switch_to(task_struct_t *prev, task_struct_t *next);
+// x0, prev task(context offset: 0) 
+// x1 = nexts task(context offset: 0)
+
+cpu_switch_to:
+    //prev task callee register backup and store
+    mov x2, sp
+    stp x19,x20, [x0, #16 * 0]
+    stp x21,x22, [x0, #16 * 1]
+    stp x23,x24, [x0, #16 * 2]
+    stp x25,x26, [x0, #16 * 3]
+    stp x27,x28, [x0, #16 * 4]
+    stp x29,x30, [x0, #16 * 5]
+
+    str x2,      [x0, #16 * 6]
+    
+    //next task callee register and restore
+    ldp x19,x20, [x1, #16 * 0]
+    ldp x21,x22, [x1, #16 * 1]
+    ldp x23,x24, [x1, #16 * 2]
+    ldp x25,x26, [x1, #16 * 3]
+    ldp x27,x28, [x1, #16 * 4]
+    ldp x29,x30, [x1, #16 * 5]
+
+    ldr x2,      [x1, #16 * 6]
+    mov sp, x2
+
+    //user_sp offset = 104
+    ldr x3, [x1, #104]
+
+    msr sp_el0, x3
+    
+    isb
+
+    ret
+    
+task_entry_trampoline:
+
+    msr daifclr, #2
+    isb
+    //Task function call(in x19)
+    blr x19
+    //Function exit, task clean routine
+    bl task_exit
+
+1:
+    wfe
+    b 1b
+
+user_first_return:
+    ldr x22, [sp, #248]
+    ldr x21, [sp, #256]
+
+    msr elr_el1, x22
+    msr spsr_el1, x21
+
+    ldp x0,x1, [sp, #16 * 0]
+    ldp x2,x3, [sp, #16 * 1]
+    ldp x4,x5, [sp, #16 * 2]
+    ldp x6,x7, [sp, #16 * 3]
+    ldp x8,x9, [sp, #16 * 4]
+    ldp x10,x11, [sp, #16 * 5]
+    ldp x12,x13, [sp, #16 * 6]
+    ldp x14,x15, [sp, #16 * 7]
+    ldp x16,x17, [sp, #16 * 8]
+    ldp x18,x19, [sp, #16 * 9]
+    ldp x20,x21, [sp, #16 * 10]
+    ldp x22,x23, [sp, #16 * 11]
+    ldp x24,x25, [sp, #16 * 12]
+    ldp x26,x27, [sp, #16 * 13]
+    ldp x28,x29, [sp, #16 * 14]
+
+    ldr x30, [sp, #16 * 15]
+    add sp, sp, #272
+
+
+    eret-e 
+
+
+=== ./sched/sched.h ===
+#ifndef SCHED_H
+#define SCHED_H
+
+#include "task.h"
+
+void sched_init(uint64_t initial_sp);
+
+task_struct_t *task_create(void(*entry_fn)(void));
+task_struct_t *task_create_user(void(*entry_fn)(void));
+
+void schedule(void);
+void sched_tick(void);
+void task_exit(void);
+
+task_struct_t *sched_get_current_task(void);
+uint32_t sched_get_live_user_tasks(void);
+
+extern void cpu_switch_to(task_struct_t *prev, task_struct_t*next);
+extern void task_entry_trampoline(void);
+extern void user_first_return(void);
+
+#endif-e 
+
+
+=== ./sched/sched.c ===
+#include "sched.h"
+#include "pmm.h"
+#include "heap.h"
+#include "uart.h"
+#include "mmu.h"
+#include "exception.h"
+
+static task_struct_t *current_task = 0;
+static task_struct_t *task_list_head = 0;
+
+static uint32_t next_pid = 0;
+static uint32_t user_stack_slot = 0;
+
+void sched_init(uint64_t initial_sp){
+    //Register the main kernel running immediately after boot as PID 0
+    task_struct_t *idle_task = (task_struct_t *)kmalloc(sizeof(task_struct_t));
+    if(!idle_task){
+        uart_puts("[SCHED ERROR] Failed to allocate Idle Task TCB!\n");
+        return;
+    }
+
+    idle_task->pid = next_pid++;
+    idle_task->state = TASK_RUNNING;
+    idle_task->time_slice = DEFAULT_TIME_SLICE;
+    idle_task->sleep_ticks = 0;
+
+    idle_task->stack_base = 0;//use main kernel
+    idle_task->user_stack_base = 0;
+    idle_task->user_stack_top = 0;
+
+    idle_task->entry_fn = 0;
+    
+    idle_task->is_user = 0;
+    
+    idle_task->context.x19 = 0;
+    idle_task->context.x20 = 0;
+    idle_task->context.x21 = 0;
+    idle_task->context.x22 = 0;
+    idle_task->context.x23 = 0;
+    idle_task->context.x24 = 0;
+    idle_task->context.x25 = 0;
+    idle_task->context.x26 = 0;
+    idle_task->context.x27 = 0;
+    idle_task->context.fp = 0;
+    idle_task->context.lr = 0;
+    idle_task->context.sp = initial_sp;
+    idle_task->context.user_sp = 0;
+    
+    idle_task->next = idle_task;//Single task circular scheduling
+
+    current_task = idle_task;
+    task_list_head = idle_task;
+
+    uart_puts("[SCHED] Schedular Initialized (Idle Task PID 0 Activate)\n");
+}
+
+task_struct_t *task_create(void (*entry_fn)(void)){
+    if(!entry_fn) return 0;
+
+    //Dynamic allocate TCB struct
+    task_struct_t *new_task = (task_struct_t*)kmalloc(sizeof(task_struct_t));
+    if(!new_task) return 0;
+
+    //Allocation one page(4KB) of physical memmory for the task's private stack
+    void *stack = pmm_alloc_page();
+    if(!stack){
+        kfree(new_task);
+        return 0;
+    }
+
+    new_task->pid = next_pid++;
+    new_task->state = TASK_READY;
+    new_task->time_slice = DEFAULT_TIME_SLICE;
+    new_task->sleep_ticks = 0;
+
+    new_task->stack_base = stack;
+    new_task->user_stack_base = 0;
+    new_task->user_stack_top = 0;
+    
+    new_task->entry_fn = entry_fn;
+    
+    new_task->is_user = 0;
+
+    //Calculate the stack top
+    uint64_t stack_top = ((uint64_t)stack + TASK_STACK_SIZE) & ~0xFULL;
+
+    //Initialize CPU Context
+    new_task->context.x19 = (uint64_t)entry_fn;
+    new_task->context.x20 = 0;
+    
+    new_task->context.lr = (uint64_t)task_entry_trampoline;
+    new_task->context.sp = stack_top;
+
+    new_task->context.user_sp = 0;
+
+    new_task->context.fp = 0;
+
+    //Insert into circular linked list
+    new_task->next = task_list_head->next;
+    task_list_head->next = new_task;
+
+    return new_task;
+}
+
+
+task_struct_t *task_create_user(void (*entry_fn)(void)){
+    if(!entry_fn) return 0;
+
+    uint64_t entry = (uint64_t)entry_fn;
+
+    if(entry < USER_START || entry >= USER_END){
+        uart_puts("[SCHED ERROR] User entry is outside user address space!\n");
+        return 0;
+    }
+
+    task_struct_t *new_task = (task_struct_t*)kmalloc(sizeof(task_struct_t));
+    if(!new_task) return 0;
+
+    //Allocation Kernel page(4KB) and User page(4KB) of physical memmory
+    void *kstack = pmm_alloc_page();
+    void *ustack = pmm_alloc_page();
+    if(!kstack || !ustack){
+        if(kstack)pmm_free_page(kstack);
+        if(ustack)pmm_free_page(ustack);
+        
+        kfree(new_task);
+        return 0;
+    }
+
+    uint64_t user_stack_va = USER_STACK_TOP - ((user_stack_slot + 1) * PAGE_SIZE);
+    uint64_t user_stack_top = user_stack_va + PAGE_SIZE;
+
+    user_stack_slot++;
+    
+
+
+    uint64_t *root = mmu_get_root_table();
+
+    mmu_map_page(root, user_stack_va, (uint64_t)ustack, MMU_FLAG_USER_DATA);
+
+    mmu_tlb_flush();
+
+
+    uint64_t kstack_top = ((uint64_t)kstack + TASK_STACK_SIZE) & ~0xFULL;
+   
+    trap_frame_t *tf = (trap_frame_t *)(kstack_top - sizeof(trap_frame_t));
+
+    uint64_t *raw = (uint64_t *)tf;
+
+    for(size_t i=0; i < sizeof(trap_frame_t)/sizeof(uint64_t); i++){
+        raw[i]=0;
+    }
+
+    //Initial ELR
+    tf->elr_el1 = entry;
+
+    tf->spsr_el1 = 0;
+
+
+    new_task->pid = next_pid++;
+    new_task->state = TASK_READY;
+    new_task->time_slice = DEFAULT_TIME_SLICE;
+    new_task->sleep_ticks = 0;
+    new_task->stack_base = kstack;
+    new_task->user_stack_base = ustack;
+    new_task->user_stack_top = user_stack_top;
+    new_task->entry_fn = entry_fn;
+    new_task->is_user = 1;
+
+
+    //Initialize CPU Context
+    new_task->context.x19 = 0;
+    new_task->context.x20 = 0;
+    new_task->context.x21 = 0;
+    new_task->context.x22 = 0;
+    new_task->context.x23 = 0;
+    new_task->context.x24 = 0;
+    new_task->context.x25 = 0;
+    new_task->context.x26 = 0;
+    new_task->context.x27 = 0;
+    new_task->context.fp = 0;
+
+    new_task->context.lr = (uint64_t)user_first_return;
+    new_task->context.sp = (uint64_t)tf;
+    new_task->context.user_sp = user_stack_top;
+
+    new_task->next = task_list_head->next;
+    task_list_head->next = new_task;
+
+
+    uart_puts("[USER] User task created\n ");
+    
+
+    uart_puts("[USER] entry = ");
+    uart_put_hex(entry);
+    uart_puts("\n");
+
+    uart_puts("[USER] kstack = ");
+    uart_put_hex((uint64_t)kstack);
+    uart_puts("\n");
+
+    uart_puts("[USER] ustack PA  = ");
+    uart_put_hex((uint64_t)ustack);
+    uart_puts("\n");
+
+    uart_puts("[USER] ustack VA  = ");
+    uart_put_hex((uint64_t)ustack);
+    uart_puts("\n");
+
+
+    uart_puts("[USER] ustack top  = ");
+    uart_put_hex(user_stack_top);
+    uart_puts("\n");
+
+    return new_task;
+}
+
+void schedule(void){
+    if(!current_task || !task_list_head) return;
+
+    task_struct_t *prev = current_task;
+    task_struct_t *next = prev->next;
+
+    //Find the next runnable task in the READY state
+    do
+    {
+        if(next->state == TASK_READY || next->state == TASK_RUNNING){
+            break;
+        }
+        next = next->next;
+    }while (next != prev);
+
+    if(next == prev){
+        if(prev->state == TASK_RUNNING)
+            return;
+        return;
+    } 
+
+
+    if(prev->state == TASK_RUNNING){
+        prev->state = TASK_READY;
+    }
+    next->state = TASK_RUNNING;
+    next->time_slice = DEFAULT_TIME_SLICE;
+
+    current_task = next;
+
+    cpu_switch_to(prev, next);
+}
+
+void sched_tick(void){
+    if(!current_task || !task_list_head) return;
+
+    task_struct_t *task = task_list_head;
+
+    do{
+        if(task->state == TASK_BLOCKED && task->sleep_ticks > 0){
+            task->sleep_ticks--;
+            if(task->sleep_ticks == 0)
+                task->state = TASK_READY;
+        }
+        
+        task = task->next;
+    }while (task!=task_list_head);
+    
+
+    if(current_task->state != TASK_RUNNING){
+        schedule();
+        return;
+    }
+    
+    if(current_task->time_slice > 0)
+        current_task->time_slice--;
+
+    if(current_task->time_slice == 0){
+        schedule();
+    }
+}
+
+void task_exit(void){
+    task_struct_t *exiting = current_task;
+
+    if(!exiting)
+        return;
+
+    exiting ->state = TASK_TERMINATED;
+    exiting ->sleep_ticks = 0;
+    exiting ->time_slice = 0;
+
+    schedule();
+
+    asm volatile("msr daifset, #2" ::: "memory");
+
+    while(1){
+        asm volatile("wfe");
+    }
+}
+
+task_struct_t *sched_get_current_task(void){
+    return current_task;
+}
+
+uint32_t sched_get_live_user_tasks(void){
+    if(!task_list_head)
+        return 0;
+
+    uint32_t count = 0;
+    task_struct_t *curr = task_list_head;
+
+    do{
+        if(curr->is_user && curr->state != TASK_TERMINATED)
+            count++;
+        curr = curr->next;            
+    }while(curr != task_list_head);
+
+    return count;
+}-e 
+
+
+=== ./sched/task.h ===
+#ifndef TASK_H
+#define TASK_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+#include "memory_layout.h"
+#include "vfs.h"
+
+#define TASK_STACK_SIZE         4096//Each Task size
+#define DEFAULT_TIME_SLICE      5   //Default 50ms
+#define MAX_FD 16
+
+//ARM64 Callee Saved Register
+typedef struct cpu_context
+{
+    uint64_t x19;
+    uint64_t x20;
+    uint64_t x21;
+    uint64_t x22;
+    uint64_t x23;
+    uint64_t x24;
+    uint64_t x25;
+    uint64_t x26;
+    uint64_t x27;
+    uint64_t x28;
+    uint64_t fp;    //x29
+    uint64_t lr;    //x39
+    uint64_t sp;    //Stack Pointer
+
+
+    uint64_t user_sp;
+
+}cpu_context_t;
+
+typedef enum task_state{
+    TASK_READY = 0,
+    TASK_RUNNING,
+    TASK_BLOCKED,
+    TASK_TERMINATED
+}task_state_t;
+
+//Task Control Block(TCB)
+typedef struct task_struct
+{
+    cpu_context_t context;      //offset 0
+    uint32_t pid;
+    task_state_t state;
+    uint32_t time_slice;        //remain ruuning ticks
+    uint32_t sleep_ticks;       //sys_sleep waiting tick
+
+    void *stack_base;           //stack start physical addr
+    void *user_stack_base;      //user stack (EL0)
+
+    file_t *fd_table[MAX_FD];
+    
+    uint64_t user_stack_top;    //user stack VA
+    
+    void (*entry_fn)(void);     //task 
+
+    uint8_t is_user;            //1 = EL0 Task, 0 = Kernel Task
+
+    struct task_struct *next;   //run queue linked list pointer
+}task_struct_t;
+
+#endif-e 
+
+
+=== ./Makefile ===
+CROSS_COMPILE ?= aarch64-linux-gnu-
+CC		:= $(CROSS_COMPILE)gcc
+AS		:= $(CROSS_COMPILE)gcc
+LD		:= $(CROSS_COMPILE)ld
+
+QEMU	:= qemu-system-aarch64
+QFLAGS	:= -M virt,gic-version=2 -cpu cortex-a53 -nographic -serial mon:stdio
+
+CFLAGS	:= -g -Wall -Wextra -O3 -ffreestanding -nostdlib -nostartfiles -mgeneral-regs-only \
+			-Iuart -Ikernel -Itest -Ipmm -Iheap -Immu -Igic -Itimer -Isched -Isyscall -Ivfs
+ASFLAGS	:= -Wall -ffreestanding -nostdlib
+LDFLAGS	:= -T linker.ld -nostdlib --no-warn-rwx-segments
+
+ifeq ($(TEST), 1)
+	CFLAGS += -DENABLE_TESTS
+endif
+
+
+BUILD_DIR	:= build
+TARGET_ELF	:= $(BUILD_DIR)/kernel.elf
+
+SRCS_C	:= kernel/kernel.c kernel/exception.c uart/uart.c pmm/pmm.c heap/heap.c mmu/mmu.c gic/gic.c timer/timer.c sched/sched.c syscall/syscall.c \
+			vfs/vfs.c vfs/devfs.c vfs/ramfs.c \
+			test/test_exception.c test/test_pmm.c test/test_heap.c test/test_mmu.c test/test_timer.c test/test_sched.c test/test_user.c 
+SRCS_S	:= boot/boot.s boot/vector.s mmu/mmu_enable.s sched/switch.s
+
+OBJS	:= 	$(patsubst %.c, $(BUILD_DIR)/%.o, $(SRCS_C)) \
+			$(patsubst %.s, $(BUILD_DIR)/%.o, $(SRCS_S))
+
+.PHONY: all run debug test clean
+
+all: $(TARGET_ELF)
+
+$(TARGET_ELF): $(OBJS) linker.ld
+		@mkdir -p $(dir $@)
+		$(LD) $(LDFLAGS) -o $@ $(OBJS)
+
+$(BUILD_DIR)/%.o: %.c
+		@mkdir -p $(dir $@)
+		$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/%.o: %.s
+		@mkdir -p $(dir $@)
+		$(AS) $(ASFLAGS) -c $< -o $@
+
+run: $(TARGET_ELF)
+		$(QEMU) $(QFLAGS) -kernel $(TARGET_ELF)
+
+debug: $(TARGET_ELF)
+		$(QEMU) $(QFLAGS) -kernel $(TARGET_ELF) -s -S
+
+test: 
+		@$(MAKE) clean
+		@$(MAKE) run TEST=1
+
+clean:
+		rm -rf $(BUILD_DIR)
+-e 
+
+
+=== ./syscall/syscall.c ===
+#include "syscall.h"
+#include "sched.h"
+#include "uart.h"
+#include "task.h"
+#include "vfs.h"
+
+static int user_range_valid(uint64_t ptr, uint64_t size){
+    if(size == 0)
+        return 1;
+    if(ptr < USER_START)
+        return 0;
+    if(ptr >= USER_END)
+        return 0;
+    
+    if(size > USER_END - ptr)
+        return 0;
+
+    return 1;
+}
+
+
+// 0: sys_yield
+static int64_t ksys_yield(void){
+    schedule();
+    return 0;
+}
+
+// 1: sys_write
+static int64_t ksys_write(int fd, const char *buf, size_t count){
+    if(fd != 1 && fd !=2) return -1; //support only stdout/stderr
+    if(!buf) return -1;
+
+    if(count > 4096)
+        return -1;
+
+    if(!user_range_valid((uint64_t)buf, count))
+        return -1;
+
+    for(size_t i = 0; i < count; i++){
+        uart_putc(buf[i]);
+    }
+    return (int64_t)count;
+}
+
+// 2: sys_getpid
+static int64_t ksys_getpid(void){
+    task_struct_t *curr = sched_get_current_task();
+    return curr ? (int64_t)curr->pid : -1;
+}
+
+// 3: sys_sleep
+static int64_t ksys_sleep(uint64_t ticks){
+    task_struct_t *curr = sched_get_current_task();
+    if(!curr) return -1;
+
+    if(ticks == 0){
+        schedule();
+        return 0;
+    }
+
+    curr->sleep_ticks = ticks;
+    curr->state = TASK_BLOCKED;
+
+    schedule();
+    
+    return 0;
+}
+
+// 4: sys_exit
+static int64_t ksys_exit(int code){
+    (void)code;
+    task_exit();
+    return 0;
+}
+
+//syscall pointer table
+static void *syscall_table[MAX_SYSCALL];
+
+void syscall_init(void){
+    uart_puts("[SYSCALL] System Call Table Initialized (5 Call Vectors Registerd)\n");
+}
+
+void syscall_dispatch(trap_frame_t *tf){
+    uint64_t syscall_num = tf->x[8];
+    task_struct_t *current = sched_get_current_task();
+
+    switch (syscall_num) {
+        case SYS_YIELD:
+            schedule();
+            tf->x[0] = 0;
+            break;
+
+        case SYS_WRITE: {
+            int fd = (int)tf->x[0];
+            const char *buf = (const char *)tf->x[1];
+            size_t count = (size_t)tf->x[2];
+
+            if (fd == 1 || fd == 2) {
+                for (size_t i = 0; i < count; i++) uart_putc(buf[i]);
+                tf->x[0] = count;
+            } else if (fd >= 0 && fd < MAX_FD && current && current->fd_table[fd]) {
+                tf->x[0] = vfs_write(current->fd_table[fd], buf, count);
+            } else {
+                tf->x[0] = (uint64_t)-1;
+            }
+            break;
+        }
+
+        case SYS_READ: {
+            int fd = (int)tf->x[0];
+            void *buf = (void *)tf->x[1];
+            size_t count = (size_t)tf->x[2];
+
+            if (fd >= 0 && fd < MAX_FD && current && current->fd_table[fd]) {
+                tf->x[0] = vfs_read(current->fd_table[fd], buf, count);
+            } else {
+                tf->x[0] = (uint64_t)-1;
+            }
+            break;
+        }
+
+        case SYS_OPEN: {
+            const char *path = (const char *)tf->x[0];
+            int flags = (int)tf->x[1];
+
+            int free_fd = -1;
+            if (current) {
+                for (int i = 3; i < MAX_FD; i++) {
+                    if (current->fd_table[i] == NULL) {
+                        free_fd = i;
+                        break;
+                    }
+                }
+            }
+
+            if (free_fd < 0) {
+                tf->x[0] = (uint64_t)-1;
+                break;
+            }
+
+            file_t *file = vfs_open(path, flags);
+            if (file) {
+                current->fd_table[free_fd] = file;
+                tf->x[0] = free_fd;
+            } else {
+                tf->x[0] = (uint64_t)-1;
+            }
+            break;
+        }
+
+        case SYS_CLOSE: {
+            int fd = (int)tf->x[0];
+            if (fd >= 0 && fd < MAX_FD && current && current->fd_table[fd]) {
+                vfs_close(current->fd_table[fd]);
+                current->fd_table[fd] = NULL;
+                tf->x[0] = 0;
+            } else {
+                tf->x[0] = (uint64_t)-1;
+            }
+            break;
+        }
+
+        case SYS_GETPID:
+            tf->x[0] = current ? current->pid : (uint64_t)-1;
+            break;
+
+        case SYS_SLEEP:
+            if (current) {
+                current->sleep_ticks = tf->x[0];
+                current->state = TASK_BLOCKED;
+                schedule();
+            }
+            tf->x[0] = 0;
+            break;
+
+        case SYS_EXIT:
+            task_exit();
+            break;
+
+        default:
+            uart_puts("[SYSCALL] Unknown Syscall Number: ");
+            uart_put_hex(syscall_num);
+            uart_puts("\n");
+            tf->x[0] = (uint64_t)-1;
+            break;
+    }
+}
+
+
+-e 
+
+
+=== ./syscall/syscall.h ===
+#ifndef SYSCALL_H
+#define SYSCALL_H
+
+#include <stdint.h>
+#include <stddef.h>
+#include "exception.h"
+
+//syscall number
+#define SYS_YIELD       0
+#define SYS_WRITE       1
+#define SYS_GETPID      2
+#define SYS_SLEEP       3
+#define SYS_EXIT        4
+#define SYS_OPEN        5
+#define SYS_READ        6
+#define SYS_CLOSE       7   
+#define MAX_SYSCALL     8   
+
+
+void syscall_init(void);
+void syscall_dispatch(trap_frame_t *tf);
+
+static inline int64_t sys_yield(void){
+    register uint64_t x8 asm("x8") = SYS_YIELD;
+    register int64_t  x0 asm("x0");
+    asm volatile("svc #0" : "=r"(x0) : "r"(x8) : "memory");
+    return x0;
+}
+
+static inline int64_t sys_write(int fd, const void *buf, size_t count){
+    register uint64_t x8 asm("x8") = SYS_WRITE;
+    register int64_t  x0 asm("x0") = (int64_t)fd;
+    register uint64_t x1 asm("x1") = (uint64_t)buf;
+    register uint64_t x2 asm("x2") = (uint64_t)count;
+    asm volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2) : "memory");
+    return x0;
+}
+
+static inline int64_t sys_getpid(void){
+    register uint64_t x8 asm("x8") = SYS_GETPID;
+    register int64_t  x0 asm("x0");
+    asm volatile("svc #0" : "=r"(x0) : "r"(x8) : "memory");
+    return x0;
+}
+
+static inline int64_t sys_sleep(uint64_t ticks){
+    register uint64_t x8 asm("x8") = SYS_SLEEP;
+    register int64_t  x0 asm("x0") = (int64_t)ticks;
+    asm volatile("svc #0" : "+r"(x0) : "r"(x8) : "memory");
+    return x0;
+}
+
+static inline void sys_exit(int code){
+    register uint64_t x8 asm("x8") = SYS_EXIT;
+    register int64_t  x0 asm("x0") = (int64_t)code;
+    asm volatile("svc #0" : : "r"(x8), "r"(x0) : "memory");
+    while(1);   
+}
+
+static inline void sys_open(const char *path, int flags){
+    register uint64_t x8 asm("x8") = SYS_EXIT;
+    register uint64_t x0 asm("x0") = (uint64_t)path;
+    register uint64_t x1 asm("x1") = (uint64_t)flags;
+
+    asm volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1) : "memory");
+    return x0;
+}
+
+static inline void sys_read(int fd, void *buf, size_t count){
+    register uint64_t x8 asm("x8") = SYS_READ;
+    register int64_t  x0 asm("x0") = (int64_t)fd;
+    register uint64_t x1 asm("x1") = (uint64_t)buf;
+    register uint64_t x2 asm("x2") = (uint64_t)count;
+
+    asm volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2) : "memory");
+    return x0;
+}
+
+static inline void sys_close(int fd){
+    register uint64_t x8 asm("x8") = SYS_CLOSE;
+    register int64_t  x0 asm("x0") = (uint64_t)fd;
+
+    asm volatile("svc #0" : "+r"(x0) : "r"(x8) : "memory");
+    return x0;
+}
+
+#endif-e 
+
+
+=== ./linker.ld ===
+ENTRY(_start)
+
+SECTIONS
+{
+    . = 0x40000000;
+
+
+    .text.boot : ALIGN(4)
+    {
+        *(.text.boot)
+    }
+    . = ALIGN(2048);
+
+    .text.vector :
+    {
+        *(.text.vector)
+    }
+
+    . = ALIGN(4096);
+    
+    .text :
+    {
+        __kernel_text_start = .;
+        *(.text*)
+        __kernel_text_end = .;
+    }
+
+    . = ALIGN(4096);
+
+
+    .rodata :
+    {
+        __kernel_rodata_start = .;
+        *(.rodata*)
+        __kernel_rodata_end = .;
+    }
+
+    . = ALIGN(4096);
+
+    .data :
+    {
+        __kernel_data_start = .;
+        *(.data*)
+        __kernel_data_end = .;
+    }
+
+    . = ALIGN(16);
+
+    .bss :
+    {
+        __bss_start = .;
+        *(.bss*)
+        *(COMMON)
+        . = ALIGN(16);
+        __bss_end = .;
+    }
+    
+    . = ALIGN(16);
+
+
+    .stack :
+    {
+        __stack_bottom = .;
+        . = . + 0x10000;
+        __stack_top = .;
+    }
+    
+    . = ALIGN(4096);
+    __kernel_end = .;
+
+    . = 0x47000000;
+    
+    .user_text :
+    {
+        
+        . = ALIGN(4096);
+        __user_text_start = .;
+        KEEP(*(.user_text*))
+        . = ALIGN(4096);
+        __user_text_end = .;
+    }
+
+    .user_rodata :
+    {
+        . = ALIGN(4096);
+        __user_rodata_start = .;
+        KEEP(*(.user_rodata*))
+        . = ALIGN(4096);
+        __user_rodata_end = .;
+    }
+
+    .user_data :
+    {
+        . = ALIGN(4096);
+        __user_data_start = .;
+        KEEP(*(.user_data*))
+        . = ALIGN(4096);
+        __user_data_end = .;
+    }
+
+    __user_image_start = __user_text_start;
+    __user_image_end = .;
+}-e 
+
+

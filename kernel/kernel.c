@@ -7,6 +7,9 @@
 #include "timer.h"
 #include "sched.h"
 #include "syscall.h"
+#include "vfs.h"
+#include "ramfs.h"
+#include "devfs.h"
 
 #ifdef ENABLE_TESTS
 #include "test.h"
@@ -59,13 +62,24 @@ void kernel_main(void) {
     syscall_init();
     uart_puts("[OK] System Call Table Initialized.\n");
 
+    vfs_init();
+    uart_puts("[OK] Virtual File System Infrastructure Initialized.\n");
+
+    ramfs_init();
+    uart_puts("[OK] RamFS Initialized and Mounted on /ram.\n");
+
+    devfs_init();
+    uart_puts("[OK] DevFS Initialized and Mounted on /dev.\n");
+
     enable_irq();
     uart_puts("[OK] CPU Global Interrupts Unmasked.\n");
+
 
 #ifdef ENABLE_TESTS
     test_timer_ticks();
     test_scheduler_preemption();
     test_user_mode();
+    test_vfs_subsystem();
 #endif
     uart_puts(">> Kernel is now in idle state.\n");
 

@@ -4,6 +4,14 @@
 
 static vnode_t *root_vnode = NULL;
 
+void *memset(void *s, int c, size_t n) {
+    unsigned char *p = (unsigned char *)s;
+    while (n--) {
+        *p++ = (unsigned char)c;
+    }
+    return s;
+}
+
 //String utility 
 static int vfs_strcmp(const char *s1, const char *s2){
     while(*s1 && (*s1 == *s2)) {s1++, s2++;}
@@ -104,11 +112,11 @@ file_t* vfs_open(const char *path, int flags){
         vfs_strncpy(parent_path, path, MAX_PATH_LEN);
         int last_slash = -1;
         for(int i=0; parent_path[i] != '\0';i++){
-            if(parent_path[i] = '/') last_slash = i;
+            if(parent_path[i] == '/') last_slash = i;
         }
 
         if(last_slash == 0){
-            vfs_strncpy(parent_path, '/', MAX_PATH_LEN);
+            vfs_strncpy(parent_path, "/", MAX_PATH_LEN);
             vfs_strncpy(filename, path + 1, MAX_FILENAME);
         }
         else if (last_slash > 0)
@@ -153,7 +161,7 @@ int64_t vfs_read(file_t *file, void *buf, size_t count){
 }
 
 int64_t vfs_write(file_t *file, const void *buf, size_t count){
-    if(!file || !file->vnode || !file->vnode->ops || !file->vnode->ops->read) return -1;
+    if(!file || !file->vnode || !file->vnode->ops || !file->vnode->ops->write) return -1;
 
     int64_t bytes_written = file->vnode->ops->write(file->vnode, file->pos, buf, count);
     if(bytes_written > 0){
@@ -179,7 +187,7 @@ vnode_t* vfs_get_root(void){
     return root_vnode;
 }
 
-void vfs_inint(void){
+void vfs_init(void){
 
     root_vnode = vfs_create_vnode("", VNODE_TYPE_DIR, NULL);
     uart_puts("[VFS] Virtual File System Infrastructured Initialized.\n");

@@ -13,7 +13,9 @@
 #define SYS_EXIT        4
 #define SYS_OPEN        5
 #define SYS_READ        6
-#define SYS_CLOSE       7
+#define SYS_CLOSE       7   
+#define MAX_SYSCALL     8   
+
 
 void syscall_init(void);
 void syscall_dispatch(trap_frame_t *tf);
@@ -25,7 +27,7 @@ static inline int64_t sys_yield(void){
     return x0;
 }
 
-static inline int64_t sys_write(int fd, const char *buf, size_t count){
+static inline int64_t sys_write(int fd, const void *buf, size_t count){
     register uint64_t x8 asm("x8") = SYS_WRITE;
     register int64_t  x0 asm("x0") = (int64_t)fd;
     register uint64_t x1 asm("x1") = (uint64_t)buf;
@@ -55,8 +57,8 @@ static inline void sys_exit(int code){
     while(1);   
 }
 
-static inline void sys_open(const char *path, int flags){
-    register uint64_t x8 asm("x8") = SYS_EXIT;
+static inline int64_t sys_open(const char *path, int flags){
+    register uint64_t x8 asm("x8") = SYS_OPEN;
     register uint64_t x0 asm("x0") = (uint64_t)path;
     register uint64_t x1 asm("x1") = (uint64_t)flags;
 
@@ -64,7 +66,7 @@ static inline void sys_open(const char *path, int flags){
     return x0;
 }
 
-static inline void sys_read(int fd, void *buf, size_t count){
+static inline int64_t sys_read(int fd, void *buf, size_t count){
     register uint64_t x8 asm("x8") = SYS_READ;
     register int64_t  x0 asm("x0") = (int64_t)fd;
     register uint64_t x1 asm("x1") = (uint64_t)buf;
@@ -74,7 +76,7 @@ static inline void sys_read(int fd, void *buf, size_t count){
     return x0;
 }
 
-static inline void sys_close(int fd){
+static inline int64_t sys_close(int fd){
     register uint64_t x8 asm("x8") = SYS_CLOSE;
     register int64_t  x0 asm("x0") = (uint64_t)fd;
 

@@ -99,7 +99,7 @@ static int ramfs_create(vnode_t *parent, const char *name, vnode_type_t type, vn
 }
 
 vnode_t* ramfs_mount(const char *mount_point){
-    vnode_t *root = vfs_get_root;
+    vnode_t *root = vfs_get_root();
     vnode_t *mnt_node = NULL;
 
     if(ramfs_create(root, mount_point, VNODE_TYPE_DIR, &mnt_node) < 0){

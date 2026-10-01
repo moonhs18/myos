@@ -7,7 +7,7 @@ QEMU	:= qemu-system-aarch64
 QFLAGS	:= -M virt,gic-version=2 -cpu cortex-a53 -nographic -serial mon:stdio
 
 CFLAGS	:= -g -Wall -Wextra -O3 -ffreestanding -nostdlib -nostartfiles -mgeneral-regs-only \
-			-Iuart -Ikernel -Itest -Ipmm -Iheap -Immu -Igic -Itimer -Isched -Isyscall
+			-Iuart -Ikernel -Itest -Ipmm -Iheap -Immu -Igic -Itimer -Isched -Isyscall -Ivfs
 ASFLAGS	:= -Wall -ffreestanding -nostdlib
 LDFLAGS	:= -T linker.ld -nostdlib --no-warn-rwx-segments
 
@@ -20,7 +20,8 @@ BUILD_DIR	:= build
 TARGET_ELF	:= $(BUILD_DIR)/kernel.elf
 
 SRCS_C	:= kernel/kernel.c kernel/exception.c uart/uart.c pmm/pmm.c heap/heap.c mmu/mmu.c gic/gic.c timer/timer.c sched/sched.c syscall/syscall.c \
-			test/test_exception.c test/test_pmm.c test/test_heap.c test/test_mmu.c test/test_timer.c test/test_sched.c test/test_user.c
+			vfs/vfs.c vfs/devfs.c vfs/ramfs.c \
+			test/test_exception.c test/test_pmm.c test/test_heap.c test/test_mmu.c test/test_timer.c test/test_sched.c test/test_user.c test/test_vfs.c
 SRCS_S	:= boot/boot.s boot/vector.s mmu/mmu_enable.s sched/switch.s
 
 OBJS	:= 	$(patsubst %.c, $(BUILD_DIR)/%.o, $(SRCS_C)) \

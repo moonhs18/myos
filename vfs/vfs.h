@@ -28,7 +28,7 @@ struct vnode;
 typedef struct vnode_ops{
     int (*open)(struct vnode *node, int flags);
     int64_t (*read)(struct vnode *node, uint64_t offset, void *buf, size_t count);
-    int64_t (*write)(struct vnode *node, uint64_t offset, void *buf, size_t count);
+    int64_t (*write)(struct vnode *node, uint64_t offset, const void *buf, size_t count);
     int (*close)(struct vnode *node);
     struct vnode* (*lookup)(struct vnode *parent, const char *name);
     int (*create)(struct vnode *parent, const char *name, vnode_type_t type, struct vnode **out_node);

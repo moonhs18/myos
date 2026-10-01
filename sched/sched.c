@@ -277,6 +277,28 @@ void sched_tick(void){
     }
 }
 
+void sched_yield(void) {
+    schedule();
+}
+
+void sched_sleep(uint64_t ticks) {
+    task_struct_t *curr = sched_get_current_task();
+    if (curr) {
+        curr->sleep_ticks = ticks;
+        curr->state = TASK_BLOCKED;
+        schedule();
+    }
+}
+
+void sched_exit_task(int code) {
+    (void)code;
+    task_struct_t *curr = sched_get_current_task();
+    if (curr) {
+        curr->state = TASK_TERMINATED;
+        schedule();
+    }
+}
+
 void task_exit(void){
     task_struct_t *exiting = current_task;
 
