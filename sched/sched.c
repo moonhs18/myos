@@ -188,7 +188,7 @@ task_struct_t *task_create_user(void (*entry_fn)(void)){
     task_list_head->next = new_task;
 
 
-    uart_puts("[USER] User task created\n ");
+    uart_puts("[USER] User task created\n");
     
 
     uart_puts("[USER] entry = ");

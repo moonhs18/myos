@@ -6,5 +6,5 @@
 (EL0 / SVC 시스템콜)[완료]       (PCB / 선점형 스케줄러)[완료]   (GIC / ARM Generic Timer) [완료]
         │
         ▼
-[Phase 7: Storage & VFS] ──► [Phase 8: Shell & Apps]
-(RamFS / Initramfs / VFS)     (ELF 로더 / Mini C Lib / 쉘)
+[Phase 7: Storage & VFS] ──►       [Phase 8: Shell & Apps]
+(RamFS / Initramfs / VFS)[완료]     (ELF 로더 / Mini C Lib / 쉘)
