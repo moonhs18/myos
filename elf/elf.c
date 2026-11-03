@@ -58,6 +58,8 @@ uint64_t elf_load(const void *elf_data, size_t size){
             uint64_t offset = phdr->p_offset;
 
             size_t page_count = (memsz + PAGE_SIZE - 1) / PAGE_SIZE;
+            uint64_t map_flags = (phdr->p_flags & PF_W) ? MMU_FLAG_USER_DATA : MMU_FLAG_USER_CODE;
+        
 
             for(size_t p=0; p <page_count; p++){
                 uint64_t curr_va = vaddr + p *PAGE_SIZE;
@@ -70,7 +72,7 @@ uint64_t elf_load(const void *elf_data, size_t size){
                         return 0;
                     }
                     elf_memset(new_phys, 0, PAGE_SIZE);
-                    mmu_map_page(root_table, curr_va, (uint64_t)new_phys, MMU_FLAG_USER_CODE);
+                    mmu_map_page(root_table, curr_va, (uint64_t)new_phys, map_flags);
                     mmu_tlb_flush();
                     pa = (uint64_t)new_phys;
                 }

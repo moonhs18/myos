@@ -94,7 +94,6 @@ void handle_lower_sync(trap_frame_t *tf, uint64_t esr, uint64_t far){
 
     if(ec == 0x15){
         syscall_dispatch(tf);
-        uart_puts("[SYSCALL] System Call Invoked from User Mode!\n");
         return;
     }
 

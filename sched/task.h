@@ -33,6 +33,11 @@ typedef struct cpu_context
 
 }cpu_context_t;
 
+_Static_assert(
+    offsetof(cpu_context_t, user_sp) == 104,
+    "cpu_switch_to : user_sp offset mismatch!"
+);
+
 typedef enum task_state{
     TASK_READY = 0,
     TASK_RUNNING,
@@ -45,6 +50,7 @@ typedef struct task_struct
 {
     cpu_context_t context;      //offset 0
     uint32_t pid;
+    char name[32];
     task_state_t state;
     uint32_t time_slice;        //remain ruuning ticks
     uint32_t sleep_ticks;       //sys_sleep waiting tick

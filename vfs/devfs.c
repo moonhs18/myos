@@ -10,10 +10,12 @@ static int devfs_console_open(vnode_t *node, int flags){
 static int64_t devfs_console_read(vnode_t *node, uint64_t offset, void *buf, size_t count){
     (void)node;
     (void)offset;
-    (void)buf;
-    (void)count;
+    char *cbuf = (char *)buf;
 
-    return 0;
+    for(size_t i=0;i<count;i++){
+        cbuf[i] = uart_getc();
+    }
+    return count;
 }
 static int64_t devfs_console_write(vnode_t *node, uint64_t offset, const void *buf, size_t count){
     (void)node;

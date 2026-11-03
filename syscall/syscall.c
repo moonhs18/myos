@@ -3,6 +3,8 @@
 #include "uart.h"
 #include "task.h"
 #include "vfs.h"
+#include "elf.h"
+#include "heap.h"
 
 static int user_range_valid(uint64_t ptr, uint64_t size){
     if(size == 0)
@@ -11,7 +13,6 @@ static int user_range_valid(uint64_t ptr, uint64_t size){
         return 0;
     if(ptr >= USER_END)
         return 0;
-    
     if(size > USER_END - ptr)
         return 0;
 
@@ -101,7 +102,7 @@ void syscall_dispatch(trap_frame_t *tf) {
             } else if (fd >= 0 && fd < MAX_FD && current && current->fd_table[fd]) {
                 tf->x[0] = vfs_write(current->fd_table[fd], buf, count);
             } else {
-                tf->x[0] = -1;
+                tf->x[0] = (uint64_t)-1;
             }
             break;
         }
@@ -111,11 +112,49 @@ void syscall_dispatch(trap_frame_t *tf) {
             void *buf = (void *)tf->x[1];
             size_t count = (size_t)tf->x[2];
 
-            if (fd >= 0 && fd < MAX_FD && current && current->fd_table[fd]) {
-                tf->x[0] = vfs_read(current->fd_table[fd], buf, count);
-            } else {
-                tf->x[0] = -1;
+            if (count > 4096 ||
+                (count > 0 && !user_range_valid((uint64_t)buf, count))) {
+                tf->x[0] = (uint64_t)-1;
+                break;
             }
+
+            // Standard Input
+            if (fd == 0) {
+                char *cbuf = (char *)buf;
+                size_t bytes_read = 0;
+
+                while (bytes_read < count) {
+                    // Wait until a character arrives from UART.
+                    char c = uart_getc();
+
+                    cbuf[bytes_read++] = c;
+
+                    // Stop reading when Enter is received.
+                    if (c == '\n') {
+                        break;
+                    }
+                }
+
+                tf->x[0] = bytes_read;
+            }
+
+            // Regular File
+            else if (fd >= 0 &&
+                    fd < MAX_FD &&
+                    current &&
+                    current->fd_table[fd]) {
+
+                tf->x[0] = vfs_read(
+                    current->fd_table[fd],
+                    buf,
+                    count
+                );
+            }
+
+            else {
+                tf->x[0] = (uint64_t)-1;
+            }
+
             break;
         }
 
@@ -124,7 +163,7 @@ void syscall_dispatch(trap_frame_t *tf) {
             int flags = (int)tf->x[1];
 
             if (!current) {
-                tf->x[0] = -1;
+                tf->x[0] = (uint64_t)-1;
                 break;
             }
 
@@ -137,7 +176,7 @@ void syscall_dispatch(trap_frame_t *tf) {
             }
 
             if (free_fd < 0) {
-                tf->x[0] = -1;
+                tf->x[0] = (uint64_t)-1;
                 break;
             }
 
@@ -146,7 +185,7 @@ void syscall_dispatch(trap_frame_t *tf) {
                 current->fd_table[free_fd] = file;
                 tf->x[0] = free_fd;
             } else {
-                tf->x[0] = -1;
+                tf->x[0] = (uint64_t)-1;
             }
             break;
         }
@@ -158,7 +197,7 @@ void syscall_dispatch(trap_frame_t *tf) {
                 current->fd_table[fd] = NULL;
                 tf->x[0] = 0;
             } else {
-                tf->x[0] = -1;
+                tf->x[0] = (uint64_t)-1;
             }
             break;
         }
@@ -176,10 +215,61 @@ void syscall_dispatch(trap_frame_t *tf) {
             sched_exit_task((int)tf->x[0]);
             break;
 
+        case SYS_READDIR: {
+            const char *path = (const char *)tf->x[0];
+            vfs_list_dir(path);
+            tf->x[0] = 0;
+            break;
+        }
+
+        case SYS_PS: {
+            sched_print_tasks();
+            tf->x[0] = 0;
+            break;
+        }
+
+        case SYS_EXECVE: {
+            const char *path = (const char *)tf->x[0];
+            file_t *f = vfs_open(path, O_RDONLY);
+            if (!f) {
+                tf->x[0] = (uint64_t)-1;
+                break;
+            }
+
+            char *elf_buf = (char *)kmalloc(4096);
+            if(!elf_buf){
+                vfs_close(f);
+                tf->x[0] = (uint64_t)-1;
+                break;
+            }
+            
+            int64_t len = vfs_read(f, elf_buf, 4096);
+            vfs_close(f);
+
+            if (len <= 0) {
+                kfree(elf_buf);
+                tf->x[0] = (uint64_t)-1;
+                break;
+            }
+
+            uint64_t entry = elf_load(elf_buf, (size_t)len);
+            kfree(elf_buf);
+
+            if (entry == 0) {
+                tf->x[0] = (uint64_t)-1;
+                break;
+            }
+
+            task_create_user_elf(path, (void (*)(void))entry);
+            tf->x[0] = 0;
+            break;
+        }
+
         default:
-            tf->x[0] = -1;
+            uart_puts("[SYSCALL ERROR] Unknown Syscall Number: ");
+            uart_put_hex(syscall_num);
+            uart_puts("\n");
+            tf->x[0] = (uint64_t)-1;
             break;
     }
 }
-
-

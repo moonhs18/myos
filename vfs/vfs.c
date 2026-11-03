@@ -183,6 +183,33 @@ int vfs_close(file_t *file){
     return 0;
 }
 
+void vfs_list_dir(const char *path){
+    vnode_t *node = vfs_lookup(path);
+    if(!node || node->type != VNODE_TYPE_DIR){
+        uart_puts("[VFS] Directory not found: ");
+        uart_puts(path);
+        uart_puts("\n");
+        return;
+    }
+
+    uart_puts("\n[VFS LISTING] Directory: ");
+    uart_puts(path);
+    uart_puts("\n-----------------------------------------------\n");
+
+    vnode_t *child = node->child_head;
+    while(child){
+        if(child->type == VNODE_TYPE_DIR)       uart_puts("[DIR]  ");
+        else if (child->type == VNODE_TYPE_DEV) uart_puts("[DEV]  ");
+        else                                    uart_puts("[FILE] ");
+
+        uart_puts(child->name);
+        uart_puts("\n");
+        child = child->next_sibling;
+    }
+
+    uart_puts("\n");
+}
+
 vnode_t* vfs_get_root(void){
     return root_vnode;
 }

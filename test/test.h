@@ -9,5 +9,6 @@ void test_timer_ticks(void);
 void test_scheduler_preemption(void);
 void test_user_mode(void);
 void test_vfs_subsystem(void);
+void test_shell_and_apps(void);
 
 #endif

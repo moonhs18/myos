@@ -13,11 +13,16 @@
 #define SYS_EXIT        4
 #define SYS_OPEN        5
 #define SYS_READ        6
-#define SYS_CLOSE       7   
-#define MAX_SYSCALL     8   
+#define SYS_CLOSE       7 
+#define SYS_READDIR     8 
+#define SYS_PS          9 
+#define SYS_EXECVE      10
+
+#define MAX_SYSCALL     11 
 
 
 void syscall_init(void);
+
 void syscall_dispatch(trap_frame_t *tf);
 
 static inline int64_t sys_yield(void){
@@ -80,6 +85,28 @@ static inline int64_t sys_close(int fd){
     register uint64_t x8 asm("x8") = SYS_CLOSE;
     register int64_t  x0 asm("x0") = (uint64_t)fd;
 
+    asm volatile("svc #0" : "+r"(x0) : "r"(x8) : "memory");
+    return x0;
+}
+
+static inline int64_t sys_readdir(const char *path){
+    register uint64_t x8 asm("x8") = SYS_READDIR;
+    register int64_t  x0 asm("x0") = (int64_t)path;
+    asm volatile("svc #0" : "+r"(x0) : "r"(x8) : "memory");
+    return x0;
+}
+
+static inline int64_t sys_ps(void){
+    register uint64_t x8 asm("x8") = SYS_PS;
+    register int64_t  x0 asm("x0");
+    asm volatile("svc #0" : "=r"(x0) : "r"(x8) : "memory");
+    return x0;
+}
+
+
+static inline int64_t sys_execve(const char *path){
+    register uint64_t x8 asm("x8") = SYS_EXECVE;
+    register int64_t  x0 asm("x0") = (int64_t)path;
     asm volatile("svc #0" : "+r"(x0) : "r"(x8) : "memory");
     return x0;
 }

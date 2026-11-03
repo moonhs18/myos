@@ -20,6 +20,13 @@ void sched_init(uint64_t initial_sp){
     }
 
     idle_task->pid = next_pid++;
+
+    idle_task->name[0] = 'i';
+    idle_task->name[1] = 'd';
+    idle_task->name[2] = 'l';
+    idle_task->name[3] = 'e';
+    idle_task->name[4] = '\0';
+
     idle_task->state = TASK_RUNNING;
     idle_task->time_slice = DEFAULT_TIME_SLICE;
     idle_task->sleep_ticks = 0;
@@ -29,8 +36,13 @@ void sched_init(uint64_t initial_sp){
     idle_task->user_stack_top = 0;
 
     idle_task->entry_fn = 0;
-    
     idle_task->is_user = 0;
+
+    for (int i = 0; i < MAX_FD; i++)
+    {
+        idle_task->fd_table[i] = NULL;
+    }
+    
     
     idle_task->context.x19 = 0;
     idle_task->context.x20 = 0;
@@ -69,6 +81,17 @@ task_struct_t *task_create(void (*entry_fn)(void)){
     }
 
     new_task->pid = next_pid++;
+
+
+    new_task->name[0] = 'k';
+    new_task->name[1] = 't';
+    new_task->name[2] = 'a';
+    new_task->name[3] = 's';
+    new_task->name[4] = 'k';
+    new_task->name[5] = '\0';
+    
+
+
     new_task->state = TASK_READY;
     new_task->time_slice = DEFAULT_TIME_SLICE;
     new_task->sleep_ticks = 0;
@@ -80,6 +103,10 @@ task_struct_t *task_create(void (*entry_fn)(void)){
     new_task->entry_fn = entry_fn;
     
     new_task->is_user = 0;
+
+    for(int i = 0; i <MAX_FD; i++){
+        new_task->fd_table[i] = NULL;
+    }
 
     //Calculate the stack top
     uint64_t stack_top = ((uint64_t)stack + TASK_STACK_SIZE) & ~0xFULL;
@@ -128,36 +155,38 @@ task_struct_t *task_create_user(void (*entry_fn)(void)){
     }
 
     uint64_t user_stack_va = USER_STACK_TOP - ((user_stack_slot + 1) * PAGE_SIZE);
-    uint64_t user_stack_top = user_stack_va + PAGE_SIZE;
+    uint64_t user_stack_top = (user_stack_va + PAGE_SIZE - 128) & ~0xFULL;
 
     user_stack_slot++;
     
 
 
     uint64_t *root = mmu_get_root_table();
-
     mmu_map_page(root, user_stack_va, (uint64_t)ustack, MMU_FLAG_USER_DATA);
-
     mmu_tlb_flush();
 
 
     uint64_t kstack_top = ((uint64_t)kstack + TASK_STACK_SIZE) & ~0xFULL;
-   
     trap_frame_t *tf = (trap_frame_t *)(kstack_top - sizeof(trap_frame_t));
 
     uint64_t *raw = (uint64_t *)tf;
-
     for(size_t i=0; i < sizeof(trap_frame_t)/sizeof(uint64_t); i++){
         raw[i]=0;
     }
 
     //Initial ELR
     tf->elr_el1 = entry;
-
     tf->spsr_el1 = 0;
-
-
     new_task->pid = next_pid++;
+
+    new_task->name[0] = 'u';
+    new_task->name[1] = 's';
+    new_task->name[2] = 'e';
+    new_task->name[3] = 'r';
+    new_task->name[4] = '\0';
+
+
+
     new_task->state = TASK_READY;
     new_task->time_slice = DEFAULT_TIME_SLICE;
     new_task->sleep_ticks = 0;
@@ -167,19 +196,14 @@ task_struct_t *task_create_user(void (*entry_fn)(void)){
     new_task->entry_fn = entry_fn;
     new_task->is_user = 1;
 
+    for(int i= 0 ;i<MAX_FD;i++){
+        new_task->fd_table[i] = NULL;
+    }
+
 
     //Initialize CPU Context
     new_task->context.x19 = 0;
     new_task->context.x20 = 0;
-    new_task->context.x21 = 0;
-    new_task->context.x22 = 0;
-    new_task->context.x23 = 0;
-    new_task->context.x24 = 0;
-    new_task->context.x25 = 0;
-    new_task->context.x26 = 0;
-    new_task->context.x27 = 0;
-    new_task->context.fp = 0;
-
     new_task->context.lr = (uint64_t)user_first_return;
     new_task->context.sp = (uint64_t)tf;
     new_task->context.user_sp = user_stack_top;
@@ -187,67 +211,122 @@ task_struct_t *task_create_user(void (*entry_fn)(void)){
     new_task->next = task_list_head->next;
     task_list_head->next = new_task;
 
-
-    uart_puts("[USER] User task created\n");
-    
-
-    uart_puts("[USER] entry = ");
-    uart_put_hex(entry);
-    uart_puts("\n");
-
-    uart_puts("[USER] kstack = ");
-    uart_put_hex((uint64_t)kstack);
-    uart_puts("\n");
-
-    uart_puts("[USER] ustack PA  = ");
-    uart_put_hex((uint64_t)ustack);
-    uart_puts("\n");
-
-    uart_puts("[USER] ustack VA  = ");
-    uart_put_hex((uint64_t)ustack);
-    uart_puts("\n");
-
-
-    uart_puts("[USER] ustack top  = ");
-    uart_put_hex(user_stack_top);
-    uart_puts("\n");
-
     return new_task;
 }
 
-void schedule(void){
-    if(!current_task || !task_list_head) return;
+task_struct_t *task_create_user_elf(const char *name, void (*entry)(void)){
+    task_struct_t *t = task_create_user(entry);
+    if(t && name){
+        int i=0;
+        while (name[i] && i<31)
+        {
+            t->name[i] = name[i];
+            i++;
+        }
+        t->name[i] = '\0';
+    }
+    return t;
+}
+
+void sched_print_tasks(void){
+    uart_puts("\nPID                 State       Name\n");
+    uart_puts("------------------------------------\n");
+
+    task_struct_t *curr = current_task;
+    if(!curr) return;
+
+    task_struct_t *p = curr;
+    do{
+
+        uart_put_hex(p->pid);
+        uart_puts("  ");
+        if(p->state == TASK_RUNNING)            uart_puts("RUNNING    ");
+        else if (p->state == TASK_READY)        uart_puts("READY      ");
+        else if (p->state == TASK_BLOCKED)      uart_puts("BLOCKED    ");
+        else                                    uart_puts("TERMINATED ");
+
+        uart_puts(p->name[0] ? p->name : "unnamed");
+        uart_puts("\n");
+        p = p->next;
+    } while (p && p != curr);
+    uart_puts("\n");
+
+
+}
+
+// Check whether a task can be scheduled.
+static int task_is_runnable(task_struct_t *task) {
+    if (!task) {
+        return 0;
+    }
+
+    return task->state == TASK_READY ||
+           task->state == TASK_RUNNING;
+}
+
+void schedule(void) {
+    if (!current_task || !task_list_head) {
+        return;
+    }
 
     task_struct_t *prev = current_task;
     task_struct_t *next = prev->next;
 
-    //Find the next runnable task in the READY state
-    do
-    {
-        if(next->state == TASK_READY || next->state == TASK_RUNNING){
+    // PID 0 is reserved for the Idle Task.
+    task_struct_t *idle = (prev->pid == 0) ? prev : NULL;
+
+    // Find the next runnable non-idle task first.
+    while (next != prev) {
+
+        if (next->pid == 0) {
+            idle = next;
+        }
+        else if (task_is_runnable(next)) {
             break;
         }
+
         next = next->next;
-    }while (next != prev);
+    }
 
-    if(next == prev){
-        if(prev->state == TASK_RUNNING)
+    // No other runnable user/kernel task was found.
+    if (next == prev) {
+
+        // Continue running the current task if it is runnable.
+        if (prev->pid != 0 && task_is_runnable(prev)) {
+            next = prev;
+        }
+
+        // Otherwise, fall back to the Idle Task.
+        else if (task_is_runnable(idle)) {
+            next = idle;
+        }
+
+        else {
             return;
+        }
+    }
+
+    // The current task is still the best runnable task.
+    if (next == prev) {
+        prev->state = TASK_RUNNING;
+        prev->time_slice = DEFAULT_TIME_SLICE;
         return;
-    } 
+    }
 
-
-    if(prev->state == TASK_RUNNING){
+    // Update previous task state.
+    if (prev->state == TASK_RUNNING) {
         prev->state = TASK_READY;
     }
+
+    // Activate next task.
     next->state = TASK_RUNNING;
     next->time_slice = DEFAULT_TIME_SLICE;
 
     current_task = next;
 
+    // Perform CPU context switching.
     cpu_switch_to(prev, next);
 }
-
 void sched_tick(void){
     if(!current_task || !task_list_head) return;
 

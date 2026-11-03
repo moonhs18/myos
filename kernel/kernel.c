@@ -10,6 +10,8 @@
 #include "vfs.h"
 #include "ramfs.h"
 #include "devfs.h"
+#include "shell.h"
+#include "task.h"
 
 #ifdef ENABLE_TESTS
 #include "test.h"
@@ -26,7 +28,12 @@ static inline uint64_t read_sp(void){
 
 void kernel_main(void) {
     
+    //Keep interrupts disabled during initialization
+    disable_irq();
+
     uart_init();
+
+    
     uart_puts("\n=======================================\n");
     uart_puts("  MiniOS (ARM64) Successfully Booted!  \n");
     uart_puts("=======================================\n");
@@ -49,7 +56,7 @@ void kernel_main(void) {
     test_heap_allocator();
     test_mmu_virtual_memory();
 #endif
-    
+
     gic_init();
     uart_puts("[OK] GICv2 Interrupt Controller Initialized.\n");
 
@@ -71,15 +78,31 @@ void kernel_main(void) {
     devfs_init();
     uart_puts("[OK] DevFS Initialized and Mounted on /dev.\n");
 
-    enable_irq();
-    uart_puts("[OK] CPU Global Interrupts Unmasked.\n");
+    //enable_irq();
+    //uart_puts("[OK] CPU Global Interrupts Unmasked.\n");
 
 
 #ifdef ENABLE_TESTS
-    test_timer_ticks();
+    test_timer_ticks(); 
     test_scheduler_preemption();
     test_user_mode();
     test_vfs_subsystem();
+    test_shell_and_apps();
+#else
+    uart_puts(">>Launching EL0 Interactive Shell Process...\n");
+    task_struct_t *shell_task =
+    task_create_user_elf("shell", shell_main);
+
+    if (shell_task == NULL) {
+        uart_puts("[ERROR] Failed to create shell task.\n");
+    } else {
+        uart_puts("[DEBUG] Starting shell without timer preemption.\n");
+
+        schedule();
+    }
+
+
+
 #endif
     uart_puts(">> Kernel is now in idle state.\n");
 

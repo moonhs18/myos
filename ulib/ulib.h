@@ -4,6 +4,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#define UCODE       __attribute__((section(".user_text")))
+#define URODATA     __attribute__((section(".user_rodata")))
+
+
 int     u_strlen(const char *s);
 int     u_strcmp(const char *s1, const char *s2);
 int     u_strncmp(const char *s1, const char *s2, size_t n);
@@ -15,7 +19,7 @@ void    u_memcpy(void *dest, const void *src, size_t n);
 void    u_putchar(char c);
 void    u_puts(const char *s);
 void    u_printf(const char *fmt, ...);
-char    u_getchar(void);
+int     u_getchar(void);
 int     u_readline(char *buf, size_t max_len);
 
 #endif

@@ -9,6 +9,7 @@
 void sched_init(uint64_t initial_sp);
 task_struct_t *task_create(void(*entry_fn)(void));
 task_struct_t *task_create_user(void(*entry_fn)(void));
+task_struct_t *task_create_user_elf(const char *name, void (*entry_fn)(void));
 
 void schedule(void);
 void sched_tick(void);
@@ -17,7 +18,7 @@ void task_exit(void);
 void sched_yield(void);
 void sched_sleep(uint64_t ticks);
 void sched_exit_task(int code);
-
+void sched_print_tasks(void);
 
 task_struct_t *sched_get_current_task(void);
 uint32_t sched_get_live_user_tasks(void);

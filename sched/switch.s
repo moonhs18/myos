@@ -19,6 +19,9 @@ cpu_switch_to:
 
     str x2,      [x0, #16 * 6]
     
+    mrs x2, sp_el0
+    str x2, [x0, #104]
+
     //next task callee register and restore
     ldp x19,x20, [x1, #16 * 0]
     ldp x21,x22, [x1, #16 * 1]
@@ -32,7 +35,6 @@ cpu_switch_to:
 
     //user_sp offset = 104
     ldr x3, [x1, #104]
-
     msr sp_el0, x3
     
     isb

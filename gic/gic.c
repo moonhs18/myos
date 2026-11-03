@@ -25,7 +25,7 @@ void gic_init(void){
     }
 
     for(int i=0;i<4;i++){
-        mmio_write32(GICD_BASE + GICD_IGROUPR + (i * 4), 0xFFFFFFFF);
+        mmio_write32(GICD_BASE + GICD_IGROUPR + (i * 4), 0x00000000);
     }
 
     //enable distributor

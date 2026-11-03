@@ -19,5 +19,8 @@ void uart_init(void);
 void uart_putc(char c);
 void uart_puts(const char *s);
 void uart_put_hex(uint64_t val);
+char uart_getc(void);
+int  uart_has_char(void);
+int  uart_try_getc(char *out);
 
 #endif

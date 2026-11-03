@@ -15,6 +15,8 @@
 #define O_CREAT         0x040
 #define O_TRUNC         0x200
 
+void vfs_list_dir(const char *path);
+
 //vnode type 
 typedef enum {
     VNODE_TYPE_FILE,

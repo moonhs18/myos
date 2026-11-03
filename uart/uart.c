@@ -38,3 +38,85 @@ void uart_put_hex(uint64_t val){
     }
 }
 
+
+char uart_getc(void)
+{
+    static int discard_lf_after_cr = 0;
+
+    for (;;) {
+
+        // Wait until RX FIFO contains data.
+        while (*UARTFR & FR_RXFE) {
+            asm volatile("yield" ::: "memory");
+        }
+
+        char c = (char)(*UARTDR & 0xFF);
+
+        // CR -> LF
+        if (c == '\r') {
+            discard_lf_after_cr = 1;
+            return '\n';
+        }
+
+        // Discard LF following CR.
+        if (c == '\n' && discard_lf_after_cr) {
+            discard_lf_after_cr = 0;
+            continue;
+        }
+
+        discard_lf_after_cr = 0;
+
+        // DEL -> Backspace
+        if ((unsigned char)c == 0x7F) {
+            c = '\b';
+        }
+
+        return c;
+    }
+}
+
+
+int uart_has_char(void){
+    return !(*UARTFR & FR_RXFE);
+}
+
+
+int uart_try_getc(char *out)
+{
+    static int discard_lf_after_cr = 0;
+
+    if (out == 0) {
+        return -1;
+    }
+
+    for (;;) {
+
+        if (*UARTFR & FR_RXFE) {
+            return 0;
+        }
+
+        char c = (char)(*UARTDR & 0xFF);
+
+        if (c == '\r') {
+            discard_lf_after_cr = 1;
+            c = '\n';
+        }
+
+        else if (c == '\n' && discard_lf_after_cr) {
+            discard_lf_after_cr = 0;
+            continue;
+        }
+
+        else {
+            discard_lf_after_cr = 0;
+        }
+
+        if ((unsigned char)c == 0x7F) {
+            c = '\b';
+        }
+
+        *out = c;
+
+        return 1;
+    }
+}
