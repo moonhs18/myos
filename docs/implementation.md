@@ -7,4 +7,4 @@
         │
         ▼
 [Phase 7: Storage & VFS] ──►       [Phase 8: Shell & Apps]
-(RamFS / Initramfs / VFS)[완료]     (ELF 로더 / Mini C Lib / 쉘)
+(RamFS / Initramfs / VFS)[완료]     (ELF 로더 / Mini C Lib / 쉘)[완료]
